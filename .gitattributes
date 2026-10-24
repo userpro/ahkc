@@ -1,0 +1,3 @@
+# 验证报告由 bench/reproduce.sh 生成到 bench/results/，该目录已被 .gitignore 忽略。
+# 文档 docs/VALIDATION*.md 只保留最近一次运行的汇总数字，原始 JSON 不入库。
+bench/results/**  linguist-generated=true -diff

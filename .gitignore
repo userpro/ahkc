@@ -1,0 +1,43 @@
+# 构建与测试产物
+*.test
+*.out
+*.prof
+*.pprof
+*.exe
+*.dll
+*.so
+/cacheload
+/coverage.*
+coverage.html
+go.work
+go.work.sum
+
+# 基准与复现脚本产物（bench/reproduce.sh 每次重新生成；入库的证据在 validation/）
+/bench/results/
+*.bench
+
+# 本地日志与临时文件
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+\#*\#
+.\#*
+
+# 本地环境变量（密钥只走环境变量，不入库）
+.env
+.env.*
+!.env.example
+
+# 编辑器、IDE 与 AI 助手数据
+/.codebuddy/
+/.idea/
+/.vscode/
+*.iml
+
+# 操作系统
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
