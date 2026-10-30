@@ -8,8 +8,8 @@ import (
 )
 
 func TestNamespacesIsolateSameKey(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1, Prior: testPrior}, nil)
-	other, err := env.c.RegisterNamespace("other", NamespaceConfig{TTL: time.Minute, Tin: 1, Prior: testPrior})
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1}, nil)
+	other, err := env.c.RegisterNamespace("other", NamespaceConfig{TTL: time.Minute, Tin: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,8 +44,8 @@ func TestNamespacesIsolateSameKey(t *testing.T) {
 // fillFence 递增使在途候选 STALE 终结；已交付的业务结果不受影响；旧值不得复活。
 // 用每分片 1 个填充令牌定住在途候选（先由同分片 key 消耗令牌），保证失效严格先于候选处理。
 func TestInvalidateKeyKillsInFlightFill(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 2, Prior: testPrior},
-		func(c *Config) { c.FillRatePerSec = 1 })
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 2},
+		nil)
 	keys := env.sameShardKeys(2)
 	a, k := keys[0], keys[1]
 	// a 发布，耗尽分片唯一填充令牌。
@@ -122,18 +122,11 @@ func TestInvalidateKeyKillsInFlightFill(t *testing.T) {
 // 代际推进使在途候选 STALE；新代际下的加载正常发布。
 // 用每分片 1 个填充令牌定住在途候选（先由同分片 key 消耗令牌），保证失效严格先于候选处理。
 func TestNamespaceInvalidateMidFillStale(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 2, Prior: testPrior},
-		func(c *Config) { c.FillRatePerSec = 1 })
-	keys := env.sameShardKeys(2)
-	a, k := keys[0], keys[1]
-	// a 发布，耗尽分片唯一填充令牌。
-	env.fetch(a, okLoader("va"))
-	env.fetch(a, okLoader("va"))
-	env.drive()
-	if _, ok, _ := env.ns.Get(a); !ok {
-		t.Fatal("a must be published")
-	}
-	// k：热度 1；第二次加载候选入队但被令牌定住（COMPLETED_PENDING）。
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 2},
+		nil)
+	k := env.sameShardKeys(1)[0]
+	release := env.holdMaintenance(env.c.c.shards[0]) // 候选停在队列，保证失效先于候选处理
+	// k：热度 1；第二次加载候选入队但被定住（COMPLETED_PENDING）。
 	if _, err := env.fetch(k, okLoader("v0")); err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +137,7 @@ func TestNamespaceInvalidateMidFillStale(t *testing.T) {
 	env.drainUntil(func() bool {
 		return env.fillQueueLen() == 1 && env.flightPhaseOf(k) == phaseCompletedPending
 	})
-	// 命名空间失效：逐任务驱动至代际推进（候选因令牌不足不会被抢先处理）。
+	// 命名空间失效：逐任务驱动至代际推进（维护被阻止，候选不会被抢先处理）。
 	errCh := make(chan error, 1)
 	go func() { errCh <- env.c.InvalidateNamespace(context.Background(), "t") }()
 	env.drainUntil(func() bool { return env.c.c.nsByName["t"].gen.Load() == 2 })
@@ -157,8 +150,9 @@ func TestNamespaceInvalidateMidFillStale(t *testing.T) {
 	if _, ok, _ := env.ns.Get(k); ok {
 		t.Fatal("old-generation candidate must not be visible")
 	}
-	// 推进 1s：令牌补足，fillStep 处理候选 → 代际不符 STALE（φ=0 热度仍达标）。
+	// 恢复维护，fillStep 处理候选 → 代际不符 STALE。
 	env.clk.Advance(time.Second)
+	release()
 	for i := 0; i < 100 && env.c.Stats().FillRejected["STALE"] == 0; i++ {
 		env.c.MaintenanceStep()
 		env.ex.Drain(10)
@@ -186,7 +180,7 @@ func TestNamespaceInvalidateMidFillStale(t *testing.T) {
 // TestInvalidateWaitContextCancel 覆盖完成凭证 Wait 的 ctx 取消分支：
 // 超时返回 ctx 错误；凭证不失效，维护处理后同一凭证可得确认。
 func TestInvalidateWaitContextCancel(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 2, Prior: testPrior}, nil)
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 2}, nil)
 	h, err := env.ns.InvalidateAsync("k")
 	if err != nil {
 		t.Fatal(err)
@@ -210,8 +204,7 @@ func TestInvalidateWaitContextCancel(t *testing.T) {
 // TestInvalidateConfirmSemantics 覆盖失效确认语义：失效确认表示逻辑失效已完成——
 // 确认后新查询不得取得旧可读版本，即便物理回收尚未完成。
 func TestInvalidateConfirmSemantics(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 2, Prior: testPrior},
-		func(c *Config) { c.Grace = time.Hour }) // 防冷却干扰
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 2}, nil)
 	for i := 0; i < 2; i++ {
 		env.fetch("k", okLoader("v1"))
 	}

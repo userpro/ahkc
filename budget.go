@@ -84,6 +84,16 @@ func (r *receipt) returnOnce() {
 	}
 }
 
+// shrinkTo 把尚未归还的预留缩小到 n，多出的额度立即回到预算。调用方须是该凭证当前唯一的使用者
+// （例如 loader 返回后、结果发布前）。
+func (r *receipt) shrinkTo(n int64) {
+	if r == nil || r.budget == nil || n >= r.amount || r.settled.Load() {
+		return
+	}
+	r.budget.avail.Add(r.amount - n)
+	r.amount = n
+}
+
 // moveTo 把尚未结算也尚未共享的凭证移入长期存储（如内嵌在 Flight / Future 中），
 // 源凭证随即失效。仅用于“先在栈上取得额度、确认受理后再落到堆对象”的两段式预留。
 func (r *receipt) moveTo(dst *receipt) {

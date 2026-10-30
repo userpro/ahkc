@@ -107,3 +107,29 @@ func (b *budget) tryReserve(amount int64) (*receipt, failReason) {
 	}
 	return r, failOK
 }
+
+// 预留缩小到实际用量：多出的额度立即回到预算；之后的归还只还缩小后的数额，不会多还。
+func TestReceiptShrinkTo(t *testing.T) {
+	b := newBudget(100)
+	r, _ := b.tryReserve(60)
+	r.shrinkTo(10)
+	if b.available() != 90 {
+		t.Fatalf("avail after shrink = %d, want 90", b.available())
+	}
+	r.shrinkTo(50) // 不能放大
+	r.shrinkTo(10) // 重复缩小无效果
+	if b.available() != 90 {
+		t.Fatalf("avail after no-op shrinks = %d, want 90", b.available())
+	}
+	r.returnOnce()
+	r.returnOnce()
+	if b.available() != 100 {
+		t.Fatalf("avail after return = %d, want 100 (over- or under-return)", b.available())
+	}
+	r.shrinkTo(0) // 已归还的凭证不再改动预算
+	if b.available() != 100 {
+		t.Fatalf("shrink after return changed the budget: %d", b.available())
+	}
+	var nilReceipt *receipt
+	nilReceipt.shrinkTo(1) // nil 安全
+}

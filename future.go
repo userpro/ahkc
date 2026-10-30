@@ -169,7 +169,7 @@ func (w *Future[V]) Take() (v V, ok bool, err error) {
 	if s == waiterReadyCached {
 		h := w.cached
 		w.cached = nil
-		v = h.Value()
+		v = h.owner.copyOut(h.e)
 		h.Release()
 		w.releaseSlot()
 		return v, true, nil

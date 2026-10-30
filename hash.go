@@ -22,9 +22,3 @@ func hashKey(seed maphash.Seed, key string) uint64 {
 func (n *namespace[V]) hashKey(key string) uint64 {
 	return mix64(hashKey(n.c.seed, key) ^ uint64(n.id)*rowSeedStep)
 }
-
-// policyHash 计算策略指纹：仅用于收益 sketch / 门卫等统计结构，
-// 索引相等性永远比较完整 key，不用指纹代替。
-func policyHash(keyHash, nsGen uint64) uint64 {
-	return mix64(keyHash ^ mix64(nsGen+0x9e3779b97f4a7c15))
-}

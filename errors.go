@@ -31,11 +31,9 @@ var (
 	ErrInvalidConfig = errors.New("ahkc: invalid config")
 	// ErrConsumed 表示 Future 的结果已被取走，不会再产生结果。
 	ErrConsumed = errors.New("ahkc: future result already consumed")
-	// ErrInvalidWeight 表示 weigher 对 loader 结果返回了非正权重。
-	ErrInvalidWeight = errors.New("ahkc: weigher returned a non-positive weight")
-	// ErrNoWeigher 表示值类型无法默认计费（含指针/引用的类型），New 时必须提供 WithWeigher。
-	ErrNoWeigher = errors.New("ahkc: value type has no default weigher; supply WithWeigher")
-	ErrExhausted = errors.New("ahkc: identity or clock range exhausted; cache stopped")
+	// ErrInvalidWeight 表示 weigh 对 loader 结果返回了非正权重。
+	ErrInvalidWeight = errors.New("ahkc: weigh returned a non-positive weight")
+	ErrExhausted     = errors.New("ahkc: identity or clock range exhausted; cache stopped")
 
 	// ErrKeyTooLarge 表示 key 超过 maxKeyBytes。
 	ErrKeyTooLarge = errors.New("ahkc: key exceeds maxKeyBytes")
@@ -109,10 +107,9 @@ const (
 	fillRejectedStale         // STALE：令牌 / expectedEntryId / 代际不再匹配
 	fillRejectedExpired       // EXPIRED：超过 hardDeadline / handoffDeadline
 	fillRejectedNotHot        // 热度未达 T_in
-	fillRejectedNoEstimate    // 估值 UNAVAILABLE
 	fillRejectedNonPositive   // 净收益 <= 0
 	fillRejectedInfeasible    // F(Q) 为空 / 索引无安装位 / 资源不可行
-	fillRejectedResourceLimit // 退休 / pending / 预算不足
+	fillRejectedResourceLimit // pending / 预算不足
 	fillRejectedQueueFull     // 填充队列满，未入队
 	fillRejectedWorkLimit     // 求解工作量超限
 	fillRejectedClosed        // 关闭
@@ -121,6 +118,7 @@ const (
 	fillRejectedAlreadyTerm   // 已终结
 	fillRejectedObserveOnly   // 仅统计模式：观察模式下不缓存
 	fillRejectedNoCache       // loader metadata explicitly refuses caching
+	fillRejectedShadowHit     // 影子缓存：该请求已虚拟命中，回源结果不再填充
 )
 
 func (r fillReason) String() string {
@@ -133,8 +131,6 @@ func (r fillReason) String() string {
 		return "EXPIRED"
 	case fillRejectedNotHot:
 		return "NOT_HOT"
-	case fillRejectedNoEstimate:
-		return "NO_ESTIMATE"
 	case fillRejectedNonPositive:
 		return "NON_POSITIVE_GAIN"
 	case fillRejectedInfeasible:
@@ -157,6 +153,8 @@ func (r fillReason) String() string {
 		return "OBSERVE_ONLY"
 	case fillRejectedNoCache:
 		return "NOT_CACHEABLE"
+	case fillRejectedShadowHit:
+		return "SHADOW_HIT"
 	default:
 		return "NONE"
 	}

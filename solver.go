@@ -8,7 +8,7 @@ import (
 // 精确子集求解。
 //
 // 求解器接收冻结快照上的真实可执行动作集：
-// 容量（条数/字节）、退休字节与记录/工作量、索引安装位置、时间轮可调度性
+// 容量（条数/字节）与索引安装位置
 // 都在 FEASIBLE 内同时核算，不能先求容量解再遗漏其他约束。
 //
 //	S* = argmin[S∈F(Q)] Σ L_v；ΔG* = G_a − K_a − Σ_O L_o − Σ_S* L_v；发布要求 ΔG* > 0。
@@ -30,13 +30,8 @@ type fillSnapshot struct {
 	q                     []victimInfo
 	n, bytes              int64 // 冻结的驻留条数/字节
 	countQuota, byteQuota int64
-	countMax              int64
-	retiredBytesAvail     int64
-	retiredRecordSlots    int64
-	removalWorkLeft       int64
 	installWithoutQ       bool
 	installMask           uint64 // Q 成员槽位落在候选探测域内的位掩码
-	wheelOK               bool
 	maxChecks             int
 	checks                int             // 本次求解实际检查的子集数（观测用）
 	sums                  *[256]subsetAgg // 通用枚举的子集累计 scratch（分片维护者独占复用；nil 时临时分配）
@@ -69,23 +64,7 @@ func (s *fillSnapshot) feasible(mask uint64, sumCount int64, sumBytes int64) boo
 	if postN > s.countQuota || postB > s.byteQuota {
 		return false
 	}
-	if postN > s.countMax {
-		return false
-	}
-	if rBytes > s.retiredBytesAvail {
-		return false
-	}
-	minSlots := s.retiredRecordSlots
-	if s.removalWorkLeft < minSlots {
-		minSlots = s.removalWorkLeft
-	}
-	if rCount > minSlots {
-		return false
-	}
 	if !s.installWithoutQ && mask&s.installMask == 0 {
-		return false
-	}
-	if !s.wheelOK {
 		return false
 	}
 	return true
@@ -151,7 +130,7 @@ func (s *fillSnapshot) exactSelect() int64 {
 	if allNonNeg && s.installWithoutQ && s.equalSized() {
 		b := s.q[0].billed
 		// 条数缺口同时受额度 countQuota 与索引物理上限 countMax 约束（见 feasible 的 postN 检查）。
-		kN := s.n + 1 - int64(s.oCount) - min(s.countQuota, s.countMax)
+		kN := s.n + 1 - int64(s.oCount) - s.countQuota
 		needB := s.bytes + s.aBytes - s.oBytes - s.byteQuota
 		var kB int64
 		if needB > 0 && b > 0 {
@@ -245,4 +224,12 @@ func (s *fillSnapshot) kSmallestLosses(k int) uint64 {
 		mask |= 1 << uint(best)
 	}
 	return mask
+}
+
+// ceilDiv 返回 a/b 向上取整；a 不大于 0 时为 0。
+func ceilDiv(a, b int64) int64 {
+	if a <= 0 {
+		return 0
+	}
+	return (a + b - 1) / b
 }

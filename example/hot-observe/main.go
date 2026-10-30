@@ -10,13 +10,13 @@ import (
 )
 
 func main() {
-	c, err := ahkc.New[string](ahkc.Config{
-		ObserveOnly: true,
-		Namespaces:  map[string]ahkc.NamespaceConfig{"user": {}},
-		Advanced: ahkc.Advanced{
-			ObserveHotKeys:     -1,                          // 本例没有回源，无需回源表
-			ObserveRequestKeys: 8, ObserveRequestSampleP: 1, // 小流量演示逐请求追踪
-			HotHistoryWindows: 2,
+	c, err := ahkc.NewBytes[string](ahkc.Config{
+		Mode:       ahkc.ModeObserve,
+		Namespaces: map[string]ahkc.NamespaceConfig{"user": {}},
+		Hot: ahkc.HotConfig{
+			RequestSlots:   8,
+			RequestSampleP: 1, // 小流量演示逐请求追踪
+			Windows:        2,
 		},
 	})
 	if err != nil {
@@ -34,7 +34,7 @@ func main() {
 			panic(err)
 		}
 		if hit {
-			panic("ObserveOnly must not cache")
+			panic("ModeObserve must not cache")
 		}
 	}
 	heat, ok := ns.Heat("hot")

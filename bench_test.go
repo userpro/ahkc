@@ -20,19 +20,17 @@ func newBenchCache(b *testing.B, entries int64, keys int) (*Cache[string], *Name
 func newBenchCacheCfg(b *testing.B, entries int64, keys int, tweak func(*Config)) (*Cache[string], *Namespace[string]) {
 	b.Helper()
 	cfg := Config{
-		ShardCount:       64,
-		MaxEntries:       entries,
-		MaxResidentBytes: 1 << 30,
-		SampleP:          1e-12,
+		Shards:     64,
+		MaxEntries: entries,
+		MaxBytes:   1 << 30,
 		Namespaces: map[string]NamespaceConfig{
-			"bench": {TTL: time.Hour, Tin: 1, Prior: &Prior{Lambda: 100}},
-		}, Advanced: Advanced{ // 保留独立采样判断，近似隔离样本传输成本
-			WheelTick: 100 * time.Millisecond, WheelSlots: 64, WheelLevels: 4},
+			"bench": {TTL: time.Hour, Tin: 1},
+		},
 	}
 	if tweak != nil {
 		tweak(&cfg)
 	}
-	c, err := New[string](cfg)
+	c, err := NewBytes[string](cfg)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -121,11 +119,11 @@ func BenchmarkIndexHitProtected(b *testing.B) {
 			b.Fatal("reader busy")
 		}
 		found := s.idx.find("key255", hash, ns.ns.id)
-		if !found.found || !found.e.readable.Load() || found.e.nsGen != ns.ns.gen.Load() || c.c.now() >= found.e.hardDeadline || c.c.state.Load() != cacheOpen {
+		if !found.found || !found.e.isReadable() || !found.e.genIs(ns.ns.gen.Load()) || c.c.now() >= found.e.hardDeadline || c.c.state.Load() != cacheOpen {
 			guard.unpin()
 			b.Fatal("miss")
 		}
-		runtime.KeepAlive(found.e.value)
+		runtime.KeepAlive(found.e.valLen)
 		guard.unpin()
 	}
 }
@@ -171,13 +169,14 @@ func BenchmarkGetMissParallel(b *testing.B) {
 // BenchmarkFetchMissLoad 测量完整 miss→singleflight→加载→交付路径（Tin 极高，不缓存）。
 func BenchmarkFetchMissLoad(b *testing.B) {
 	cfg := Config{
-		ShardCount: 64, MaxEntries: 16384, MaxResidentBytes: 1 << 30,
-		SampleP: 1e-12,
+		Shards:     64,
+		MaxEntries: 16384,
+		MaxBytes:   1 << 30,
 		Namespaces: map[string]NamespaceConfig{
-			"bench": {TTL: time.Hour, Tin: 1000}, // no prior or samples: no profitable fill can be estimated
-		}, Advanced: Advanced{WheelTick: 100 * time.Millisecond, WheelSlots: 64, WheelLevels: 4},
+			"bench": {TTL: time.Hour, Tin: 1000}, // Tin is unreachable: no fill is ever admitted
+		},
 	}
-	c, err := New[string](cfg)
+	c, err := NewBytes[string](cfg)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -207,10 +206,10 @@ func BenchmarkFetchMissLoad(b *testing.B) {
 	})
 }
 
-// TestGetHitZeroAlloc 普通值读取稳态 0 堆分配（栈上 Request）。
-func TestGetHitZeroAlloc(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1, Prior: testPrior},
-		func(c *Config) { c.SampleP = 1e-12 }) // 近似隔离样本传输分配
+// TestGetHitAllocContract 读取的分配契约：借用视图命中稳态 0 堆分配（栈上 Request 与 Borrowed）；
+// Get 返回调用方独占的值，字节串布局拷贝一次，定长布局仍为 0。
+func TestGetHitAllocContract(t *testing.T) {
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1}, nil)
 	if _, err := env.fetch("hit", okLoader("v")); err != nil {
 		t.Fatal(err)
 	}
@@ -218,13 +217,55 @@ func TestGetHitZeroAlloc(t *testing.T) {
 	if _, ok, _ := env.ns.Get("hit"); !ok {
 		t.Fatal("expected cached")
 	}
+	var b Borrowed[string]
 	allocs := testing.AllocsPerRun(1000, func() {
-		if _, ok, err := env.ns.Get("hit"); err != nil || !ok {
+		var r Request[string]
+		if err := env.ns.BeginRequestOn(&r, "hit"); err != nil {
+			t.Fatal(err)
+		}
+		if ok, err := env.ns.BorrowOn(&r, &b); err != nil || !ok {
 			t.Fatal("miss")
 		}
+		if b.Value() != "v" {
+			t.Fatal("borrowed the wrong value")
+		}
+		b.Release()
 	})
 	if allocs != 0 {
-		t.Fatalf("hit path must be zero-alloc, got %.2f allocs/op", allocs)
+		t.Fatalf("borrowed hit must be zero-alloc, got %.2f allocs/op", allocs)
+	}
+	if a := testing.AllocsPerRun(1000, func() { env.ns.Get("hit") }); a != 1 {
+		t.Fatalf("Get of a bytes-layout value copies exactly once, got %.2f allocs/op", a)
+	}
+}
+
+// 定长布局的 Get 是值拷贝，稳态 0 堆分配。
+func TestFlatGetHitZeroAlloc(t *testing.T) {
+	cfg := validConfig()
+	cfg.Namespaces = map[string]NamespaceConfig{"t": {TTL: time.Minute, Tin: 1}}
+	c, err := NewFlat[int64](cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeManual(t, c, cfg.Runtime.Executor.(*ManualExecutor))
+	ns, _ := c.Namespace("t")
+	ex := cfg.Runtime.Executor.(*ManualExecutor)
+	fut, err := ns.FetchAsync("k", func(context.Context, string) (int64, error) { return 42, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 64; i++ {
+		c.MaintenanceStep()
+		ex.Drain(100)
+	}
+	if _, ready, err := fut.Take(); !ready || err != nil {
+		t.Fatalf("take: ready=%v err=%v", ready, err)
+	}
+	if v, ok, _ := ns.Get("k"); !ok || v != 42 {
+		t.Fatalf("flat value: %d %v", v, ok)
+	}
+	if a := testing.AllocsPerRun(1000, func() { ns.Get("k") }); a != 0 {
+		t.Fatalf("flat Get must be zero-alloc, got %.2f", a)
 	}
 }
 
@@ -261,14 +302,14 @@ func BenchmarkGetHotKeyParallel(b *testing.B) {
 // 工作集（8192 key）远大于容量（1024 条），Tin=1、先验使收益为正，加载近乎瞬时。
 func BenchmarkFetchFillChurn(b *testing.B) {
 	cfg := Config{
-		ShardCount: 16, MaxEntries: 1024, MaxResidentBytes: 1 << 28,
-		SampleP: 1.0 / 64, FillRatePerSec: 1e9,
+		Shards:     16,
+		MaxEntries: 1024,
+		MaxBytes:   1 << 28,
 		Namespaces: map[string]NamespaceConfig{
-			"bench": {TTL: time.Hour, Tin: 1, Prior: &Prior{Lambda: 100}},
+			"bench": {TTL: time.Hour, Tin: 1},
 		},
-		Advanced: Advanced{WheelTick: 100 * time.Millisecond, WheelSlots: 64, WheelLevels: 4},
 	}
-	c, err := New[string](cfg)
+	c, err := NewBytes[string](cfg)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -313,9 +354,9 @@ func BenchmarkFetchFillChurn(b *testing.B) {
 
 func trackingTweak(q float64) func(*Config) {
 	return func(c *Config) {
-		c.ObserveRequestKeys, c.ObserveRequestSampleP = 64, q
-		c.HotHistoryWindows = 60
-		c.HotHistoryInterval = time.Minute
+		c.Hot.RequestSlots, c.Hot.RequestSampleP = 64, q
+		c.Hot.Windows = 60
+		c.Hot.Interval = time.Minute
 	}
 }
 
@@ -323,7 +364,7 @@ func BenchmarkReadAllocations(b *testing.B) {
 	for _, mode := range []string{"Get", "Fetch", "GetOwned", "FetchAsync", "OwnedBusy"} {
 		b.Run(mode, func(b *testing.B) {
 			_, ns := newBenchCacheCfg(b, 64, 1, func(c *Config) {
-				c.ShardCount, c.MaxOwnedHandles = 1, 1
+				c.Shards, c.Limits.MaxOwnedHandles = 1, 1
 			})
 			if mode == "OwnedBusy" {
 				h, ok, err := ns.GetOwned("key0")
@@ -373,9 +414,13 @@ func BenchmarkInitialize(b *testing.B) {
 		b.Run(fmt.Sprintf("observeOnly=%v", only), func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				c, err := New[string](Config{
-					MaxEntries: 1024, MaxResidentBytes: 64 << 20,
-					ObserveOnly: only, DisableTicker: true,
+				c, err := NewBytes[string](Config{
+					MaxEntries: 1024,
+					MaxBytes:   64 << 20,
+					Mode:       modeOf(only),
+					Runtime: RuntimeConfig{
+						DisableTicker: true,
+					},
 				})
 				if err != nil {
 					b.Fatal(err)
@@ -397,7 +442,6 @@ func benchTracking(b *testing.B, keys int, hot bool, miss bool) {
 	} {
 		b.Run(mode.name, func(b *testing.B) {
 			_, ns := newBenchCacheCfg(b, 16384, keys, func(c *Config) {
-				c.SampleP = 1.0 / 1024 // 所有组使用相同的生产默认收益采样率。
 				if mode.tweak != nil {
 					mode.tweak(c)
 				}
@@ -442,12 +486,24 @@ func BenchmarkObserveGetLongTailParallel(b *testing.B) { benchTracking(b, 0, fal
 // BenchmarkHotWindowRoll 测量一次窗口滚动采集 + 发布（全部槽位已满）。
 func BenchmarkHotWindowRoll(b *testing.B) {
 	clk := NewManualClock(1_000_000_000)
-	c, err := New[string](Config{
-		ShardCount: 16, MaxEntries: 1024, MaxResidentBytes: 1 << 22, ObserveOnly: true,
-		DisableTicker: true, Clock: clk, Executor: discardExecutor{},
-		Namespaces: map[string]NamespaceConfig{"t": {TTL: time.Minute, Tin: 3, Prior: &Prior{Lambda: 100}}},
-		Advanced: Advanced{ObserveHotKeys: 128, ObserveRequestKeys: 64, ObserveRequestSampleP: 1,
-			HotHistoryWindows: 60, HotHistoryTopN: 16},
+	c, err := NewBytes[string](Config{
+		Shards:     16,
+		MaxEntries: 1024,
+		MaxBytes:   1 << 22,
+		Mode:       ModeObserve,
+		Namespaces: map[string]NamespaceConfig{"t": {TTL: time.Minute, Tin: 3}},
+		Hot: HotConfig{
+			LoadSlots:      128,
+			RequestSlots:   64,
+			RequestSampleP: 1,
+			Windows:        60,
+			TopN:           16,
+		},
+		Runtime: RuntimeConfig{
+			DisableTicker: true,
+			Clock:         clk,
+			Executor:      discardExecutor{},
+		},
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -466,7 +522,7 @@ func BenchmarkHotWindowRoll(b *testing.B) {
 		for i, k := range keys {
 			kh := ns.ns.hashKey(k)
 			s := cc.shardOf(kh)
-			s.hot.touchLoad(ns.ns.id, kh, k, bucketIndex(now, int64(cc.cfg.HeatDelta)), now)
+			s.hot.touchLoad(ns.ns.id, kh, k, bucketIndex(now, int64(cc.cfg.Heat.Delta)), now)
 			s.req.record(ns.ns.id, kh, k, now+int64(i&1))
 		}
 		clk.Advance(1100 * time.Millisecond)
@@ -482,10 +538,18 @@ func BenchmarkHotWindowRoll(b *testing.B) {
 
 // BenchmarkHotKeys20 测量监控适配器常见的 HotKeys(20) 轮询。
 func BenchmarkHotKeys20(b *testing.B) {
-	c, err := New[string](Config{
-		ShardCount: 16, MaxEntries: 1024, MaxResidentBytes: 1 << 22, ObserveOnly: true, DisableTicker: true,
-		Namespaces: map[string]NamespaceConfig{"t": {TTL: time.Minute, Tin: 3, Prior: &Prior{Lambda: 100}}},
-		Advanced:   Advanced{ObserveHotKeys: 128},
+	c, err := NewBytes[string](Config{
+		Shards:     16,
+		MaxEntries: 1024,
+		MaxBytes:   1 << 22,
+		Mode:       ModeObserve,
+		Namespaces: map[string]NamespaceConfig{"t": {TTL: time.Minute, Tin: 3}},
+		Hot: HotConfig{
+			LoadSlots: 128,
+		},
+		Runtime: RuntimeConfig{
+			DisableTicker: true,
+		},
 	})
 	if err != nil {
 		b.Fatal(err)

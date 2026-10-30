@@ -8,7 +8,7 @@
 //	go test -run '^$' -bench BenchmarkGetHit -benchmem -benchtime=1s -count=2 ./bench
 //
 // 口径说明：ns/op 是平均值，不是单请求 P50/P99；并行基准的 ns/op 是吞吐倒数。
-// 与 validation 相同：SampleP=1e-12 近似隔离样本传输成本，服务压测用默认 1/1024。
+// 与 validation 相同：请求热点追踪默认关闭，微基准不含追踪成本。
 package bench
 
 import (
@@ -27,15 +27,13 @@ import (
 // 周期维护后台发布；预热轮询整个工作集，避免发布竞争造成假 miss）。
 func newBenchCache(b *testing.B, entries int64, keys int) (*ahkc.Cache[string], *ahkc.Namespace[string]) {
 	b.Helper()
-	c, err := ahkc.New[string](ahkc.Config{
-		ShardCount:       64,
-		MaxEntries:       entries,
-		MaxResidentBytes: 1 << 30,
-		SampleP:          1e-12,
+	c, err := ahkc.NewBytes[string](ahkc.Config{
+		Shards:     64,
+		MaxEntries: entries,
+		MaxBytes:   1 << 30,
 		Namespaces: map[string]ahkc.NamespaceConfig{
-			"bench": {TTL: time.Hour, Tin: 1, Prior: &ahkc.Prior{Lambda: 100}},
+			"bench": {TTL: time.Hour, Tin: 1},
 		},
-		Advanced: ahkc.Advanced{WheelTick: 100 * time.Millisecond, WheelSlots: 64, WheelLevels: 4},
 	})
 	if err != nil {
 		b.Fatal(err)
@@ -172,15 +170,13 @@ func BenchmarkGetOwnedHotKeyParallel(b *testing.B) {
 // BenchmarkFetchMissLoad 完整 miss → singleflight → 加载 → 交付路径
 // （Tin 极高且无先验，填充不可估，因此每次都是真实回源）。
 func BenchmarkFetchMissLoad(b *testing.B) {
-	c, err := ahkc.New[string](ahkc.Config{
-		ShardCount:       64,
-		MaxEntries:       16384,
-		MaxResidentBytes: 1 << 30,
-		SampleP:          1e-12,
+	c, err := ahkc.NewBytes[string](ahkc.Config{
+		Shards:     64,
+		MaxEntries: 16384,
+		MaxBytes:   1 << 30,
 		Namespaces: map[string]ahkc.NamespaceConfig{
 			"bench": {TTL: time.Hour, Tin: 1000},
 		},
-		Advanced: ahkc.Advanced{WheelTick: 100 * time.Millisecond, WheelSlots: 64, WheelLevels: 4},
 	})
 	if err != nil {
 		b.Fatal(err)

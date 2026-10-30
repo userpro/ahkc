@@ -25,7 +25,7 @@ type executorTaskStripe struct {
 }
 
 func newExecutorTaskPool[V any](c *cache[V], size int) *executorTaskPool {
-	stripeCount := c.cfg.ShardCount
+	stripeCount := c.cfg.Shards
 	if stripeCount > 64 {
 		stripeCount = 64
 	}
@@ -89,7 +89,7 @@ func (c *cache[V]) trySubmit(task func()) bool {
 	}
 	c.tasks.Add(1)
 	t.fn = task
-	if c.cfg.Executor.TrySubmit(t.run) {
+	if c.cfg.Runtime.Executor.TrySubmit(t.run) {
 		return true
 	}
 	t.fn = nil

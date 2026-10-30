@@ -28,7 +28,7 @@ func entryKey(h *winHeap, e winEntry) string {
 
 // 迟到事件只写回仍完好且未采集的所属窗口，绝不回写已采集窗口。
 func TestReqTrackerLateEventsDoNotLeak(t *testing.T) {
-	tr := newReqTracker(4, 8, 0, 10)
+	tr, _ := newReqTracker(4, 8, 0, 10, true)
 	tr.record(1, 11, "a", 15) // 窗口 1
 	tr.record(1, 22, "b", 25) // 窗口 2
 	tr.record(1, 11, "a", 12) // 迟到：窗口 1 缓冲仍完好 → 写回窗口 1
@@ -48,7 +48,7 @@ func TestReqTrackerLateEventsDoNotLeak(t *testing.T) {
 
 // 追踪表见过的最新窗口恰好已被采集时，迟到事件应计入最新未采集窗口，而不是重新写入已采集窗口。
 func TestReqTrackerLateEventForCollectedNewestWindow(t *testing.T) {
-	tr := newReqTracker(4, 8, 0, 10)
+	tr, _ := newReqTracker(4, 8, 0, 10, true)
 	tr.record(1, 11, "a", 15) // 窗口 1 是见过的最新窗口
 	if _, samples, _, _ := collectReq(t, tr, 1); samples != 1 {
 		t.Fatalf("window 1 samples = %d", samples)
@@ -64,7 +64,7 @@ func TestReqTrackerLateEventForCollectedNewestWindow(t *testing.T) {
 
 // 维护滞后超过一个窗口：被覆盖的未采集窗口计入 lost，并标记 Partial。
 func TestReqTrackerPartialAndLost(t *testing.T) {
-	tr := newReqTracker(4, 8, 0, 10)
+	tr, _ := newReqTracker(4, 8, 0, 10, true)
 	tr.record(1, 11, "a", 15) // 窗口 1（奇偶 1）
 	tr.record(1, 11, "a", 16)
 	tr.record(1, 33, "c", 35) // 窗口 3，同奇偶：覆盖窗口 1 的未采集数据
@@ -80,7 +80,7 @@ func TestReqTrackerPartialAndLost(t *testing.T) {
 
 // 窗口内无事件但缓冲滞留更旧数据：丢弃并计入 lost，不算 Partial。
 func TestReqTrackerStaleBufferIsEmptyWindow(t *testing.T) {
-	tr := newReqTracker(4, 8, 0, 10)
+	tr, _ := newReqTracker(4, 8, 0, 10, true)
 	tr.record(1, 11, "a", 15) // 窗口 1，从未被采集
 	_, samples, lost, partial := collectReq(t, tr, 3)
 	if samples != 0 || lost != 1 || partial {
@@ -93,7 +93,7 @@ func TestReqTrackerStaleBufferIsEmptyWindow(t *testing.T) {
 func TestReqTrackerSpaceSavingBound(t *testing.T) {
 	const slots = 8
 	rng := rand.New(rand.NewSource(7))
-	tr := newReqTracker(slots, 8, 0, 1<<40)
+	tr, _ := newReqTracker(slots, 8, 0, 1<<40, true)
 	truth := map[string]uint64{}
 	var total uint64
 	zipf := rand.NewZipf(rng, 1.3, 2, 63)
@@ -126,7 +126,7 @@ func TestReqTrackerSpaceSavingBound(t *testing.T) {
 // 回源追踪表同样满足 Space-Saving 上界，且窗口总量包含被逐出 key 的事件。
 func TestHotTrackerSpaceSavingBound(t *testing.T) {
 	const slots = 8
-	tr := newHotTracker(slots, true, 0, 1<<40)
+	tr, _ := newHotTracker(slots, 8, 0, 1<<40, true)
 	rng := rand.New(rand.NewSource(11))
 	zipf := rand.NewZipf(rng, 1.3, 2, 63)
 	truth := map[string]uint64{}
@@ -137,15 +137,15 @@ func TestHotTrackerSpaceSavingBound(t *testing.T) {
 		total++
 		tr.touchLoad(1, uint64(k[1])*131+uint64(k[2]), k, 0, 5)
 	}
-	h := newWinHeap(slots, 0)
+	h := newWinHeap(slots, 8)
 	tot, lost, partial := tr.collect(0, &h, 0, 0)
 	if tot[0] != total || tot[1] != 0 || lost != 0 || partial {
 		t.Fatalf("tot=%v lost=%d partial=%v, want loads=%d", tot, lost, partial, total)
 	}
 	for _, e := range h.es {
 		lo, hi := uint64(e.n), uint64(e.n)+uint64(e.err)
-		if got := truth[e.key]; got < lo || got > hi {
-			t.Fatalf("%s: true=%d not in [%d,%d]", e.key, got, lo, hi)
+		if k := entryKey(&h, e); truth[k] < lo || truth[k] > hi {
+			t.Fatalf("%s: true=%d not in [%d,%d]", k, truth[k], lo, hi)
 		}
 	}
 	if len(h.es) != slots {
@@ -153,33 +153,34 @@ func TestHotTrackerSpaceSavingBound(t *testing.T) {
 	}
 }
 
-func TestHotWindowCombinedCountsDoNotWrap(t *testing.T) {
-	tr := newHotTracker(1, true, 0, 10)
+// 计数饱和时窗口记录不回绕：加载数不超过总观测数，合并数 = 总观测 - 加载。
+func TestHotWindowSaturatedCountsDoNotWrap(t *testing.T) {
+	tr, _ := newHotTracker(1, 8, 0, 10, true)
 	tr.touchLoad(1, 1, "hot", 0, 0)
-	tr.wn[0][0], tr.wm[0][0] = math.MaxUint32, 1
-	h := newWinHeap(1, 0)
+	tr.rank[0][0], tr.aux[0][0] = math.MaxUint32, math.MaxUint32
+	h := newWinHeap(1, 8)
 	tr.collect(0, &h, 0, 0)
-	if len(h.es) != 1 || h.es[0].n != math.MaxUint32 || h.es[0].m != 1 {
-		t.Fatal("combined load and merge counts wrapped to zero")
+	if len(h.es) != 1 || h.es[0].n != math.MaxUint32 || h.es[0].m != 0 || h.es[0].score != math.MaxUint32 {
+		t.Fatalf("saturated counts wrapped: %+v", h.es)
 	}
 }
 
 // ---- 集成：窗口解耦、总量、缺窗、合并 ----
 
 func histCfg(c *Config) {
-	c.ObserveOnly = true
-	c.ObserveHotKeys = 8
-	c.ObserveRequestKeys = 8
-	c.ObserveRequestSampleP = 1
-	c.HotHistoryWindows = 4
+	c.Mode = ModeObserve
+	c.Hot.LoadSlots = 8
+	c.Hot.RequestSlots = 8
+	c.Hot.RequestSampleP = 1
+	c.Hot.Windows = 4
 }
 
 func TestRequestHistoryPreservesLongKey(t *testing.T) {
-	key := strings.Repeat("k", 1<<16)
+	key := strings.Repeat("k", 1<<16-1) // MaxKeyBytes 上限
 	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute}, func(c *Config) {
 		histCfg(c)
 		c.MaxKeyBytes = len(key)
-		c.ObserveHotKeys, c.ObserveRequestKeys = -1, 1
+		c.Hot.LoadSlots, c.Hot.RequestSlots = 0, 1
 	})
 	defer closeManual(t, env.c, env.ex)
 	if _, _, err := env.ns.Get(key); err != nil {
@@ -199,9 +200,9 @@ func TestHotSnapshotResultsAreIndependent(t *testing.T) {
 			env := newTestEnv(t, NamespaceConfig{TTL: time.Minute}, func(c *Config) {
 				histCfg(c)
 				if label {
-					c.HotKeyLabel = func(_, key string) (string, bool) { return key, true }
+					c.Hot.Label = func(_, key string) (string, bool) { return key, true }
 				}
-				c.OnHotWindow = func(s HotSnapshot) {
+				c.Hot.OnWindow = func(s HotSnapshot) {
 					s.Top[0].Key, s.Requests[0].Key = "callback", "callback"
 				}
 			})
@@ -229,9 +230,9 @@ func TestHotSnapshotResultsAreIndependent(t *testing.T) {
 }
 
 func TestHotHistoryWindowDecoupledFromHeat(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior}, func(c *Config) {
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3}, func(c *Config) {
 		histCfg(c)
-		c.HotHistoryWindows, c.HotHistoryInterval = 3, 10*time.Second
+		c.Hot.Windows, c.Hot.Interval = 3, 10*time.Second
 	})
 	for i := 0; i < 5; i++ {
 		if _, err := env.fetch("hot", okLoader("v")); err != nil {
@@ -276,9 +277,9 @@ func TestHotHistoryWindowDecoupledFromHeat(t *testing.T) {
 
 // 请求热点包含命中：缓存命中的热 key 仍出现在请求榜上（回源榜里则没有）。
 func TestRequestHotCountsHits(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior}, func(c *Config) {
-		c.ObserveRequestKeys, c.ObserveRequestSampleP = 8, 1
-		c.HotHistoryWindows = 2
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3}, func(c *Config) {
+		c.Hot.RequestSlots, c.Hot.RequestSampleP = 8, 1
+		c.Hot.Windows = 2
 	})
 	for i := 0; i < 5; i++ { // 前 3 次回源并发布，后 2 次命中
 		if _, err := env.fetch("k1", okLoader("v-k1")); err != nil {
@@ -300,12 +301,12 @@ func TestRequestHotCountsHits(t *testing.T) {
 		t.Fatalf("WindowRequests = %v, want 15（5 次 Fetch + 10 次 Get，含命中）", got)
 	}
 	if len(hist[0].Top) != 0 {
-		t.Fatalf("Top must be empty without ObserveHotKeys: %+v", hist[0].Top)
+		t.Fatalf("Top must be empty without Hot.LoadSlots: %+v", hist[0].Top)
 	}
 }
 
 func TestHotWindowSkippedWhenMaintenanceLags(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior}, histCfg)
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3}, histCfg)
 	if _, err := env.fetch("k", okLoader("v")); err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +324,7 @@ func TestHotWindowSkippedWhenMaintenanceLags(t *testing.T) {
 }
 
 func TestHotWindowMergedTotals(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior}, histCfg)
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3}, histCfg)
 	f1, err := env.ns.FetchAsync("k", okLoader("v"))
 	if err != nil {
 		t.Fatal(err)
@@ -353,9 +354,9 @@ func TestHotWindowMergedTotals(t *testing.T) {
 
 // 分片很多时增量采集：每个维护周期只处理固定预算的槽位，采完才发布。
 func TestHotWindowIncrementalCollection(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior}, func(c *Config) {
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3}, func(c *Config) {
 		histCfg(c)
-		c.ShardCount, c.ObserveHotKeys, c.ObserveRequestKeys = 64, 128, 0 // 8192 槽 > 4096 预算
+		c.Shards, c.Hot.LoadSlots, c.Hot.RequestSlots = 64, 512, 0 // 32768 槽 > 16384 预算
 	})
 	if _, err := env.fetch("k", okLoader("v")); err != nil {
 		t.Fatal(err)
@@ -375,9 +376,9 @@ func TestHotWindowIncrementalCollection(t *testing.T) {
 // ---- 导出：游标、映射、回调 ----
 
 func TestHotWindowsSinceCursor(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior}, func(c *Config) {
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3}, func(c *Config) {
 		histCfg(c)
-		c.HotHistoryWindows = 2
+		c.Hot.Windows = 2
 	})
 	for i := 0; i < 4; i++ {
 		env.clk.Advance(1100 * time.Millisecond)
@@ -408,9 +409,9 @@ func TestHotWindowsSinceCursor(t *testing.T) {
 func TestHotKeyLabelAppliedEverywhere(t *testing.T) {
 	var mu sync.Mutex
 	var got []HotSnapshot
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior}, func(c *Config) {
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3}, func(c *Config) {
 		histCfg(c)
-		c.HotKeyLabel = func(ns, key string) (string, bool) {
+		c.Hot.Label = func(ns, key string) (string, bool) {
 			switch key {
 			case "drop":
 				return "", false
@@ -419,7 +420,7 @@ func TestHotKeyLabelAppliedEverywhere(t *testing.T) {
 			}
 			return ns + ":" + key + "#h", true
 		}
-		c.OnHotWindow = func(s HotSnapshot) {
+		c.Hot.OnWindow = func(s HotSnapshot) {
 			mu.Lock()
 			got = append(got, s)
 			mu.Unlock()
@@ -457,8 +458,8 @@ func TestHotKeyLabelAppliedEverywhere(t *testing.T) {
 	mu.Unlock()
 	// 内部历史不被映射修改。
 	ring := env.c.c.hotHist.ring[0]
-	if len(ring.Top) != 3 {
-		t.Fatalf("internal history was modified: %+v", ring.Top)
+	if len(ring.top) != 3 {
+		t.Fatalf("internal history was modified: %+v", ring.top)
 	}
 	if st := env.c.Stats(); st.HotExportPanics == 0 {
 		t.Fatalf("label panics were not counted: %+v", st)
@@ -467,9 +468,9 @@ func TestHotKeyLabelAppliedEverywhere(t *testing.T) {
 
 func TestOnHotWindowPanicIsolated(t *testing.T) {
 	var calls atomic.Int32
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior}, func(c *Config) {
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3}, func(c *Config) {
 		histCfg(c)
-		c.OnHotWindow = func(HotSnapshot) { calls.Add(1); panic("callback bug") }
+		c.Hot.OnWindow = func(HotSnapshot) { calls.Add(1); panic("callback bug") }
 	})
 	for i := 0; i < 2; i++ {
 		env.clk.Advance(1100 * time.Millisecond)
@@ -485,9 +486,9 @@ func TestOnHotWindowPanicIsolated(t *testing.T) {
 }
 
 func TestOnHotWindowBusyCounted(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior}, func(c *Config) {
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3}, func(c *Config) {
 		histCfg(c)
-		c.OnHotWindow = func(HotSnapshot) {}
+		c.Hot.OnWindow = func(HotSnapshot) {}
 	})
 	env.clk.Advance(1100 * time.Millisecond)
 	env.c.MaintenanceStep() // 通知已入执行器队列但尚未执行
@@ -507,10 +508,9 @@ func TestOnHotWindowBusyCounted(t *testing.T) {
 
 // 请求热点追踪不能让既有路径出现堆分配（命中、持续换新 key 的 miss）。
 func TestObserveRequestZeroAlloc(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1, Prior: testPrior}, func(c *Config) {
-		c.SampleP = 1e-12 // 近似隔离收益样本传输分配
-		c.ObserveRequestKeys, c.ObserveRequestSampleP = 8, 1
-		c.HotHistoryWindows = 2
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1}, func(c *Config) {
+		c.Hot.RequestSlots, c.Hot.RequestSampleP = 8, 1
+		c.Hot.Windows = 2
 	})
 	if _, err := env.fetch("hit", okLoader("v")); err != nil {
 		t.Fatal(err)
@@ -519,7 +519,13 @@ func TestObserveRequestZeroAlloc(t *testing.T) {
 	if _, ok, _ := env.ns.Get("hit"); !ok {
 		t.Fatal("expected cached")
 	}
-	if a := testing.AllocsPerRun(1000, func() { env.ns.Get("hit") }); a != 0 {
+	var b Borrowed[string]
+	if a := testing.AllocsPerRun(1000, func() {
+		var r Request[string]
+		env.ns.BeginRequestOn(&r, "hit")
+		env.ns.BorrowOn(&r, &b)
+		b.Release()
+	}); a != 0 {
 		t.Fatalf("hit with request tracking: %.2f allocs/op, want 0", a)
 	}
 	keys := make([]string, 4096)
@@ -537,13 +543,13 @@ func TestObserveRequestZeroAlloc(t *testing.T) {
 func TestHotRollAndExportAllocs(t *testing.T) {
 	for _, withCallback := range []bool{false, true} {
 		t.Run(fmt.Sprintf("callback=%v", withCallback), func(t *testing.T) {
-			env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior}, func(c *Config) {
+			env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3}, func(c *Config) {
 				histCfg(c)
-				c.ObserveHotKeys, c.ObserveRequestKeys = 32, 32
-				c.HotHistoryTopN = 16
+				c.Hot.LoadSlots, c.Hot.RequestSlots = 32, 32
+				c.Hot.TopN = 16
 				if withCallback {
-					c.OnHotWindow = func(HotSnapshot) {}
-					c.Executor = discardExecutor{}
+					c.Hot.OnWindow = func(HotSnapshot) {}
+					c.Runtime.Executor = discardExecutor{}
 				}
 			})
 			c := env.c.c
@@ -557,7 +563,7 @@ func TestHotRollAndExportAllocs(t *testing.T) {
 					kh := env.ns.ns.hashKey(k)
 					s := c.shardOf(kh)
 					for j := 0; j <= i%3; j++ {
-						s.hot.touchLoad(env.ns.ns.id, kh, k, bucketIndex(now, int64(c.cfg.HeatDelta)), now)
+						s.hot.touchLoad(env.ns.ns.id, kh, k, bucketIndex(now, int64(c.cfg.Heat.Delta)), now)
 						s.req.record(env.ns.ns.id, kh, k, now)
 					}
 				}
@@ -573,8 +579,8 @@ func TestHotRollAndExportAllocs(t *testing.T) {
 			if a := testing.AllocsPerRun(50, round); a > 3 {
 				t.Fatalf("roll allocs = %.1f, want <= 3", a)
 			}
-			if a := testing.AllocsPerRun(50, func() { env.c.HotKeys(5) }); a > 1 {
-				t.Fatalf("HotKeys(5) allocs = %.1f, want <= 1", a)
+			if a := testing.AllocsPerRun(50, func() { env.c.HotKeys(5) }); a > 2 {
+				t.Fatalf("HotKeys(5) allocs = %.1f, want <= 2 (result slice + key buffer)", a)
 			}
 		})
 	}
@@ -588,18 +594,23 @@ func (discardExecutor) TrySubmit(func()) bool { return true }
 // 并发压测：请求/回源追踪、滚动、游标拉取、映射与回调并发（race 覆盖）。
 func TestHotWindowRequestTrackingConcurrentStress(t *testing.T) {
 	var notified atomic.Uint64
-	c, err := New[string](Config{
-		ShardCount:       4,
-		MaxEntries:       1024,
-		MaxResidentBytes: 1 << 22,
-		ObserveOnly:      true,
-		HeatDelta:        10 * time.Millisecond,
-		Namespaces:       map[string]NamespaceConfig{"t": {TTL: time.Minute, Tin: 3}},
-		Advanced: Advanced{
-			ObserveHotKeys: 16, ObserveRequestKeys: 16, ObserveRequestSampleP: 0.25,
-			HotHistoryWindows: 4, HotHistoryInterval: 100 * time.Millisecond,
-			HotKeyLabel: func(ns, key string) (string, bool) { return key + "#", key != "k3" },
-			OnHotWindow: func(HotSnapshot) { notified.Add(1) },
+	c, err := NewBytes[string](Config{
+		Shards:     4,
+		MaxEntries: 1024,
+		MaxBytes:   1 << 22,
+		Mode:       ModeObserve,
+		Namespaces: map[string]NamespaceConfig{"t": {TTL: time.Minute, Tin: 3}},
+		Heat: HeatConfig{
+			Delta: 10 * time.Millisecond,
+		},
+		Hot: HotConfig{
+			LoadSlots:      16,
+			RequestSlots:   16,
+			RequestSampleP: 0.25,
+			Windows:        4,
+			Interval:       100 * time.Millisecond,
+			Label:          func(ns, key string) (string, bool) { return key + "#", key != "k3" },
+			OnWindow:       func(HotSnapshot) { notified.Add(1) },
 		},
 	})
 	if err != nil {
@@ -675,10 +686,19 @@ func TestHotWindowRequestTrackingConcurrentStress(t *testing.T) {
 // 内置时钟下历史窗口按 Unix 时间对齐：当前窗口的墙钟范围必须包含"现在"，
 // 且边界落在窗口宽度的整数倍上（多实例同窗口数据可直接相加）。
 func TestHotWindowAlignedToUnixTime(t *testing.T) {
-	c, err := New[string](Config{
-		MaxEntries: 64, MaxResidentBytes: 1 << 20, ObserveOnly: true, DisableTicker: true,
-		Namespaces: map[string]NamespaceConfig{"t": {TTL: time.Minute, Tin: 3, Prior: testPrior}},
-		Advanced:   Advanced{ObserveHotKeys: 4, HotHistoryWindows: 2, HotHistoryInterval: time.Minute},
+	c, err := NewBytes[string](Config{
+		MaxEntries: 64,
+		MaxBytes:   1 << 20,
+		Mode:       ModeObserve,
+		Namespaces: map[string]NamespaceConfig{"t": {TTL: time.Minute, Tin: 3}},
+		Hot: HotConfig{
+			LoadSlots: 4,
+			Windows:   2,
+			Interval:  time.Minute,
+		},
+		Runtime: RuntimeConfig{
+			DisableTicker: true,
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -700,7 +720,7 @@ func TestHotWindowAlignedToUnixTime(t *testing.T) {
 
 func TestHotWindowConfigValidation(t *testing.T) {
 	base := func(c *Config) {
-		c.ObserveHotKeys, c.HotHistoryWindows = 4, 2
+		c.Hot.LoadSlots, c.Hot.Windows = 4, 2
 	}
 	cases := []struct {
 		name   string
@@ -708,25 +728,25 @@ func TestHotWindowConfigValidation(t *testing.T) {
 		ok     bool
 	}{
 		{"valid", func(c *Config) { base(c) }, true},
-		{"explicit interval ok", func(c *Config) { base(c); c.HotHistoryInterval = time.Minute }, true},
-		{"interval below 1ms", func(c *Config) { base(c); c.HotHistoryInterval = time.Microsecond }, false},
-		{"interval above 24h", func(c *Config) { base(c); c.HotHistoryInterval = 25 * time.Hour }, false},
+		{"explicit interval ok", func(c *Config) { base(c); c.Hot.Interval = time.Minute }, true},
+		{"interval below 1ms", func(c *Config) { base(c); c.Hot.Interval = time.Microsecond }, false},
+		{"interval above 24h", func(c *Config) { base(c); c.Hot.Interval = 25 * time.Hour }, false},
 		{"interval shorter than collection needs", func(c *Config) {
 			base(c)
-			c.PeriodicInterval, c.HotHistoryInterval = 50*time.Millisecond, 60*time.Millisecond
+			c.Runtime.PeriodicInterval, c.Hot.Interval = 50*time.Millisecond, 60*time.Millisecond
 		}, false},
-		{"request keys without history", func(c *Config) { c.ObserveRequestKeys = 4 }, false},
-		{"request keys negative", func(c *Config) { base(c); c.ObserveRequestKeys = -1 }, false},
-		{"request keys over dimension cap", func(c *Config) { base(c); c.ObserveRequestKeys = 1<<24 + 1 }, false},
-		{"request sampleP above 1", func(c *Config) { base(c); c.ObserveRequestKeys, c.ObserveRequestSampleP = 4, 1.5 }, false},
-		{"request sampleP negative", func(c *Config) { base(c); c.ObserveRequestKeys, c.ObserveRequestSampleP = 4, -0.1 }, false},
-		{"request-only history", func(c *Config) { c.ObserveRequestKeys, c.HotHistoryWindows = 4, 2 }, true},
-		{"history without any tracker", func(c *Config) { c.HotHistoryWindows = 2 }, false},
+		{"request keys without history", func(c *Config) { c.Hot.RequestSlots = 4 }, false},
+		{"request keys negative", func(c *Config) { base(c); c.Hot.RequestSlots = -1 }, false},
+		{"request keys over dimension cap", func(c *Config) { base(c); c.Hot.RequestSlots = 1<<24 + 1 }, false},
+		{"request sampleP above 1", func(c *Config) { base(c); c.Hot.RequestSlots, c.Hot.RequestSampleP = 4, 1.5 }, false},
+		{"request sampleP negative", func(c *Config) { base(c); c.Hot.RequestSlots, c.Hot.RequestSampleP = 4, -0.1 }, false},
+		{"request-only history", func(c *Config) { c.Hot.RequestSlots, c.Hot.Windows = 4, 2 }, true},
+		{"history without any tracker", func(c *Config) { c.Hot.Windows = 2 }, false},
 	}
 	for _, tc := range cases {
 		cfg := validConfig()
 		tc.mutate(&cfg)
-		_, err := New[string](cfg)
+		_, err := NewBytes[string](cfg)
 		if tc.ok && err != nil {
 			t.Errorf("%s: unexpected error %v", tc.name, err)
 		}
@@ -736,9 +756,36 @@ func TestHotWindowConfigValidation(t *testing.T) {
 	}
 	// 默认值：采样率 1/1024，历史窗口 = 热度窗口。
 	cfg := validConfig()
-	cfg.ObserveRequestKeys, cfg.HotHistoryWindows = 4, 2
+	cfg.Hot.RequestSlots, cfg.Hot.Windows = 4, 2
 	cfg.applyDefaults()
-	if cfg.ObserveRequestSampleP != 1.0/1024 || cfg.HotHistoryInterval != cfg.HeatDelta {
-		t.Fatalf("defaults: q=%v interval=%v", cfg.ObserveRequestSampleP, cfg.HotHistoryInterval)
+	if cfg.Hot.RequestSampleP != 1.0/1024 || cfg.Hot.Interval != cfg.Heat.Delta {
+		t.Fatalf("defaults: q=%v interval=%v", cfg.Hot.RequestSampleP, cfg.Hot.Interval)
+	}
+}
+
+// BenchmarkReqTrackerRecord 测量请求热点追踪表在“大 key 空间长尾”流量下的单次记录成本：
+// 绝大多数样本是未追踪的新 key，每次都要完整 find + claimSlot（线性扫描）。
+func BenchmarkReqTrackerRecord(b *testing.B) {
+	for _, slots := range []int{256, 1024, 4096, 16384} {
+		b.Run(fmt.Sprintf("slots=%d", slots), func(b *testing.B) {
+			tr, _ := newReqTracker(slots, 64, 0, uint64(time.Minute), true)
+			keys := make([]string, 1<<16)
+			for i := range keys {
+				keys[i] = fmt.Sprintf("key-%d", i)
+			}
+			now := int64(time.Second)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				// 80% 落在 64 个热 key 上，20% 是长尾新 key。
+				var k int
+				if i%5 != 0 {
+					k = i % 64
+				} else {
+					k = 64 + int(uint64(i)*2654435761%uint64(len(keys)-64))
+				}
+				tr.record(1, mix64(uint64(k)+1), keys[k], now)
+			}
+		})
 	}
 }

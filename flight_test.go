@@ -30,6 +30,16 @@ func (e *testEnv) drainUntil(cond func() bool) {
 	}
 }
 
+// holdMaintenance 阻止分片维护被调度，使已入队的填充候选停在队列中；
+// 返回的 release 恢复调度并触发一轮维护。
+func (e *testEnv) holdMaintenance(s *shard[string]) (release func()) {
+	s.ownerState.Store(ownerRunning)
+	return func() {
+		s.ownerState.Store(ownerIdle)
+		e.c.c.signalMaintenance(s)
+	}
+}
+
 // waitReal 轮询等待真实时间条件（并发 drain goroutine 场景）。
 func waitReal(t testing.TB, what string, cond func() bool) {
 	t.Helper()
@@ -45,7 +55,7 @@ func waitReal(t testing.TB, what string, cond func() bool) {
 // TestFlightTimeoutThenLateSourceCleanup 覆盖 A.6 TIMED_OUT_IO_RUNNING：
 // 等待者按时限终结（ErrTimeout）；底层 I/O 不取消，迟到结果真实结束后清理孤儿记录并归还全部额度。
 func TestFlightTimeoutThenLateSourceCleanup(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1000, Prior: testPrior}, nil)
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1000}, nil)
 	release := make(chan struct{})
 	loader := func(ctx context.Context, key string) (string, error) {
 		<-release
@@ -84,7 +94,7 @@ func TestFlightTimeoutThenLateSourceCleanup(t *testing.T) {
 	if av := env.c.c.responseBytes.available(); av != env.c.c.responseBytes.limit {
 		t.Fatalf("response budget leaked: avail=%d limit=%d", av, env.c.c.responseBytes.limit)
 	}
-	if av := env.c.c.waiterBudget.available(); av != int64(env.c.c.cfg.MaxWaitersTotal) {
+	if av := env.c.c.waiterBudget.available(); av != int64(env.c.c.cfg.Limits.MaxWaitersTotal) {
 		t.Fatalf("waiter budget leaked: avail=%d", av)
 	}
 	// 同身份新加载可立即注册（槽位已释放）。
@@ -97,7 +107,7 @@ func TestFlightTimeoutThenLateSourceCleanup(t *testing.T) {
 
 // TestWaiterSettleOnce 覆盖 I8：waiter 只结算一次；Cancel 幂等且只归还一次额度。
 func TestWaiterSettleOnce(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1000, Prior: testPrior}, nil)
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1000}, nil)
 	release := make(chan struct{})
 	loader := func(ctx context.Context, key string) (string, error) {
 		<-release
@@ -117,7 +127,7 @@ func TestWaiterSettleOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	total := int64(env.c.c.cfg.MaxWaitersTotal)
+	total := int64(env.c.c.cfg.Limits.MaxWaitersTotal)
 	if av := env.c.c.waiterBudget.available(); av != total-3 {
 		t.Fatalf("waiter budget after 3 waiters: %d", av)
 	}
@@ -186,7 +196,7 @@ func (e *testEnv) sameShardKeys(n int) []string {
 // TestCompletedPendingReuse 覆盖 COMPLETED_PENDING 复用：填充交接期间，
 // 同身份请求直接复用已完成结果，不发起新加载。
 func TestCompletedPendingReuse(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 2, Prior: testPrior}, nil)
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 2}, nil)
 	var loads atomic.Int32
 	loader := func(ctx context.Context, key string) (string, error) {
 		loads.Add(1)
@@ -228,8 +238,8 @@ func TestCompletedPendingReuse(t *testing.T) {
 // TestOverloadIOPermits 覆盖过载行为：真实 I/O 并发额度耗尽时新加载报 ErrOverloaded，
 // 不排队、不阻塞，业务侧可退避。
 func TestOverloadIOPermits(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1000, Prior: testPrior},
-		func(c *Config) { c.MaxConcurrentLoads = 1 })
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1000},
+		func(c *Config) { c.Limits.MaxConcurrentLoads = 1 })
 	release := make(chan struct{})
 	loader := func(ctx context.Context, key string) (string, error) {
 		<-release
@@ -259,8 +269,8 @@ func TestOverloadIOPermits(t *testing.T) {
 
 // TestOverloadWaiterBudget：全局 waiter 额度耗尽时合并加入失败，报 ErrOverloaded。
 func TestOverloadWaiterBudget(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1000, Prior: testPrior},
-		func(c *Config) { c.MaxWaitersTotal = 2; c.MaxWaitersPerKey = 8 })
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1000},
+		func(c *Config) { c.Limits.MaxWaitersTotal = 2; c.Limits.MaxWaitersPerKey = 8 })
 	release := make(chan struct{})
 	loader := func(ctx context.Context, key string) (string, error) {
 		<-release
@@ -288,25 +298,17 @@ func TestOverloadWaiterBudget(t *testing.T) {
 // TestFillQueueFullStillDelivers 覆盖 A.6 契约：填充队列满只影响“是否缓存”，
 // 业务结果照常交付；队列腾出后候选仍可发布。
 func TestFillQueueFullStillDelivers(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 2, Prior: testPrior},
-		func(c *Config) { c.FillQueueSize = 1; c.FillRatePerSec = 1 }) // 每分片令牌 1，手动时钟不补充
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 2},
+		func(c *Config) { c.Limits.FillQueueSize = 1 })
 	var loads atomic.Int32
 	loader := func(ctx context.Context, key string) (string, error) {
 		loads.Add(1)
 		return "v-" + key, nil
 	}
-	// 三个 key 落在同一分片：共享填充令牌与填充队列。
-	keys := env.sameShardKeys(3)
-	a, b, c := keys[0], keys[1], keys[2]
-	// a：两次 fetch 后发布（消耗唯一填充令牌）。
-	env.fetch(a, loader)
-	env.fetch(a, loader)
-	env.drive()
-	if _, ok, _ := env.ns.Get(a); !ok {
-		t.Fatal("a must be published")
-	}
-	// b：候选入队（cap=1 占满），填充令牌耗尽 → 滞留队列。
-	// 注意：队列滞留期间不能用 env.fetch 的 drive（维护会等令牌空转），逐任务驱动。
+	// 两个 key 落在同一分片：共享填充队列；阻止该分片维护，让候选滞留队列。
+	keys := env.sameShardKeys(2)
+	b, c := keys[0], keys[1]
+	release := env.holdMaintenance(env.c.c.shards[0])
 	env.fetch(b, loader) // 热度 1，NOT_HOT 拒绝，不入队
 	fb, err := env.ns.FetchAsync(b, loader)
 	if err != nil {
@@ -319,7 +321,7 @@ func TestFillQueueFullStillDelivers(t *testing.T) {
 		t.Fatalf("b waiter: %v %v", v, err)
 	}
 	if _, ok, _ := env.ns.Get(b); ok {
-		t.Fatal("b must still be queued (no fill tokens)")
+		t.Fatal("b must still be queued (maintenance held)")
 	}
 	// c：热度达标后候选入队失败（QUEUE_FULL），但业务结果照常交付。
 	fc1, err := env.ns.FetchAsync(c, loader) // 热度 1
@@ -346,18 +348,18 @@ func TestFillQueueFullStillDelivers(t *testing.T) {
 	if _, ok, _ := env.ns.Get(c); ok {
 		t.Fatal("c must not be cached when its candidate was rejected")
 	}
-	// 时钟推进补充令牌后，b 发布（恰好 1s：补 1 个令牌；φ=0 前桶全权重热度仍达标；未超 HandoffTimeout=2s）。
-	env.clk.Advance(1 * time.Second)
+	// 恢复维护后 b 发布（未超 HandoffTimeout=2s）。
+	release()
 	env.drive()
 	if _, ok, _ := env.ns.Get(b); !ok {
-		t.Fatal("b must publish after tokens refill")
+		t.Fatal("b must publish after maintenance resumes")
 	}
 }
 
 // TestLoaderPanicRecovery 覆盖加载契约：loader panic 按错误终结（PanicError），
 // 额度不泄漏，实例继续可用。
 func TestLoaderPanicRecovery(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1, Prior: testPrior}, nil)
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1}, nil)
 	panicLoader := func(ctx context.Context, key string) (string, error) { panic("boom") }
 	_, err := env.fetch("p", panicLoader)
 	if err == nil {
@@ -391,7 +393,7 @@ func TestLoaderPanicRecovery(t *testing.T) {
 // TestCloseBlockedByOrphanIO 覆盖 A.9 三阶段：停止受理 ≠ 工作终结 ≠ 回收完成；
 // 未结束的真实 I/O 阻塞 RECLAIMED，Close 报告 ctx 错误但不强制结束 I/O。
 func TestCloseBlockedByOrphanIO(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1000, Prior: testPrior}, nil)
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1000}, nil)
 	release := make(chan struct{})
 	loader := func(ctx context.Context, key string) (string, error) {
 		<-release
@@ -451,7 +453,7 @@ func TestCloseBlockedByOrphanIO(t *testing.T) {
 // 永久丢失（等待者死锁 / flight 槽泄漏）。确定性构造该交错：持有 gate 后
 // 运行 loader，释放 gate 后泵必须完成通知。
 func TestPumpGateFailureDoesNotLoseSignal(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1000, Prior: testPrior}, nil)
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1000}, nil)
 	fut, err := env.ns.FetchAsync("k", okLoader("v"))
 	if err != nil {
 		t.Fatal(err)
@@ -484,7 +486,7 @@ func TestPumpGateFailureDoesNotLoseSignal(t *testing.T) {
 // TestFutureWaitContextCancel 覆盖 Wait 的 ctx 取消分支：取消只解除自己的
 // 等待（底层 I/O 不取消），waiter 槽位立即归还；后续 Wait 得 ErrCanceled。
 func TestFutureWaitContextCancel(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1000, Prior: testPrior}, nil)
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1000}, nil)
 	release := make(chan struct{})
 	loader := func(ctx context.Context, key string) (string, error) {
 		<-release
@@ -514,7 +516,7 @@ func TestFutureWaitContextCancel(t *testing.T) {
 	}
 	close(release)
 	env.drive()
-	total := int64(env.c.c.cfg.MaxWaitersTotal)
+	total := int64(env.c.c.cfg.Limits.MaxWaitersTotal)
 	if av := env.c.c.waiterBudget.available(); av != total {
 		t.Fatalf("waiter budget not returned after cancel+load: %d", av)
 	}
@@ -527,7 +529,7 @@ func TestFutureWaitContextCancel(t *testing.T) {
 // waiterReady（有载荷）与 waiterReadyInline（有界错误）下取消，
 // 引用与槽位只归还一次，Take 得 ErrCanceled。
 func TestFutureCancelAfterReady(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1000, Prior: testPrior}, nil)
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1000}, nil)
 	// 成功结果就绪后取消：delivery 引用释放、响应预算归还。
 	fut, err := env.ns.FetchAsync("ok", okLoader("v"))
 	if err != nil {
@@ -555,7 +557,7 @@ func TestFutureCancelAfterReady(t *testing.T) {
 	if av := env.c.c.responseBytes.available(); av != env.c.c.responseBytes.limit {
 		t.Fatalf("response budget leaked by canceled waiters: %d", av)
 	}
-	total := int64(env.c.c.cfg.MaxWaitersTotal)
+	total := int64(env.c.c.cfg.Limits.MaxWaitersTotal)
 	if av := env.c.c.waiterBudget.available(); av != total {
 		t.Fatalf("waiter budget leaked by canceled waiters: %d", av)
 	}

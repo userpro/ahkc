@@ -17,17 +17,21 @@ import (
 
 func main() {
 	signal, stop := make(chan struct{}, 1), make(chan struct{})
-	c, err := ahkc.New[string](ahkc.Config{
-		ObserveOnly: true,
-		Namespaces:  map[string]ahkc.NamespaceConfig{"user": {}},
-		Advanced: ahkc.Advanced{
-			ObserveHotKeys: 16, ObserveRequestKeys: 16, ObserveRequestSampleP: 1,
-			HotHistoryWindows: 8, HotHistoryInterval: 500 * time.Millisecond, HotHistoryTopN: 5,
-			HotKeyLabel: func(namespace, key string) (string, bool) {
+	c, err := ahkc.NewBytes[string](ahkc.Config{
+		Mode:       ahkc.ModeObserve,
+		Namespaces: map[string]ahkc.NamespaceConfig{"user": {}},
+		Hot: ahkc.HotConfig{
+			LoadSlots:      16,
+			RequestSlots:   16,
+			RequestSampleP: 1,
+			Windows:        8,
+			Interval:       500 * time.Millisecond,
+			TopN:           5,
+			Label: func(namespace, key string) (string, bool) {
 				sum := sha256.Sum256([]byte(namespace + "/" + key))
 				return hex.EncodeToString(sum[:8]), true // 标签映射不改变内部追踪
 			},
-			OnHotWindow: func(ahkc.HotSnapshot) {
+			OnWindow: func(ahkc.HotSnapshot) {
 				select {
 				case signal <- struct{}{}:
 				default:

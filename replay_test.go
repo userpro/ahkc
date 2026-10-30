@@ -399,7 +399,7 @@ func runReferenceReplay(t *testing.T, name, kind, digest string, events []replay
 			r.Loads++
 			p.gate[id].add(now)
 			if p.gate[id].value(now) >= 2 {
-				p.admit(&replayEntry{id: id, bytes: DefaultWeigher(replayKey(id), replayValue(id)), deadline: now + p.ttl, grace: now + 2*replayDelta, low: -1, heat: replayHeat{era: now / replayDelta}})
+				p.admit(&replayEntry{id: id, bytes: bytesWeigh(replayKey(id), replayValue(id)), deadline: now + p.ttl, grace: now + 2*replayDelta, low: -1, heat: replayHeat{era: now / replayDelta}})
 			}
 		}
 		if len(p.entries) > replayCount || p.bytes > replayBytes || p.bytes < 0 {
@@ -414,14 +414,7 @@ func runReferenceReplay(t *testing.T, name, kind, digest string, events []replay
 func runNativeReplay(t *testing.T, name, variant, digest string, events []replayEvent) replayResult {
 	t.Helper()
 	clock, executor := NewManualClock(int64(time.Second)), NewManualExecutor()
-	model := newCostTable(t, CostTableConfig{Clock: clock, Unit: "synthetic-work", Classes: 4, MergeFactor: 1, DisableAutoObserve: true, MaxAge: time.Hour})
-	for class, cost := range replayCosts {
-		model.Observe(uint32(class), cost)
-	}
-	tin, p, victims := 2.0, 1.0, 8
-	if variant == "AHKC-low-sampling" {
-		p = 1.0 / 64
-	}
+	tin, victims := 2.0, 8
 	if variant == "AHKC-m1" {
 		victims = 1
 	}
@@ -429,28 +422,49 @@ func runNativeReplay(t *testing.T, name, variant, digest string, events []replay
 		tin = .01
 	}
 	shards := 1
-	if variant == "AHKC-4shards" || variant == "AHKC-no-transfer" {
+	if variant == "AHKC-4shards" {
 		shards = 4
 	}
-	cfg := Config{ShardCount: shards, MaxEntries: replayCount, MaxResidentBytes: replayBytes, MaxEntryBytes: 32 << 10, MaxResultBytes: 32 << 10, MaxConcurrentLoads: 8,
-		HeatDelta: time.Duration(replayDelta), ValueDelta: time.Duration(replayDelta),
-		SampleP: p, NMin: 2, HorizonW: 200 * time.Millisecond,
-		FillRatePerSec: 1e6,
-		Clock:          clock, Executor: executor, DisableTicker: true, PeriodicInterval: time.Millisecond, MaxTTL: 2 * time.Second, HandoffTimeout: time.Millisecond,
+	cfg := Config{
+		Shards:         shards,
+		MaxEntries:     replayCount,
+		MaxBytes:       replayBytes,
+		MaxEntryBytes:  32 << 10,
+		MaxResultBytes: 32 << 10,
 		Namespaces: map[string]NamespaceConfig{
-			"a": {TTL: time.Duration(replayTTL(name)), Tin: tin, Prior: &Prior{Lambda: 100}, Model: model},
-			"b": {TTL: time.Duration(replayTTL(name)), Tin: tin, Prior: &Prior{Lambda: 100}, Model: model},
-		}, Advanced: Advanced{MaxNamespaces: 2, MaxWaitersTotal: 64, HeatCap: 64, ValueWidth: 512, VictimLimit: victims, FillQueueSize: 16, RetiredRecords: 64, RetiredBytes: 128 << 10, PendingBytes: 64 << 10, FlightStripes: 2, FlightsPerStripe: 8, SampleStripes: 2, SampleBufferSize: 128, ReaderSlotsPerShard: 8, WheelTick: time.Millisecond, WheelSlots: 64, WheelLevels: 4},
+			"a": {TTL: time.Duration(replayTTL(name)), Tin: tin},
+			"b": {TTL: time.Duration(replayTTL(name)), Tin: tin},
+		},
+		Heat: HeatConfig{
+			Delta: time.Duration(replayDelta),
+		},
+		Evict: EvictConfig{
+			Horizon:     200 * time.Millisecond,
+			VictimLimit: victims,
+		},
+		Limits: LimitsConfig{
+			MaxConcurrentLoads:  8,
+			HandoffTimeout:      time.Millisecond,
+			MaxNamespaces:       2,
+			MaxWaitersTotal:     64,
+			FillQueueSize:       16,
+			PendingBytes:        64 << 10,
+			FlightStripes:       2,
+			FlightsPerStripe:    8,
+			ReaderSlotsPerShard: 8,
+		},
+		Runtime: RuntimeConfig{
+			Clock:            clock,
+			Executor:         executor,
+			DisableTicker:    true,
+			PeriodicInterval: time.Millisecond,
+		},
 	}
-	c, err := New[string](cfg, WithResultMetadata[string](func(_ string, value string) ResultMetadata {
-		class := uint32(value[0] - 'a')
-		return ResultMetadata{CostClass: &class}
+	c, err := NewBytes[string](cfg, WithResultMetadata[string](func(_ string, value string) ResultMetadata {
+		return ResultMetadata{Cost: float32(replayCosts[value[0]-'a'])}
 	}))
 	if err != nil {
 		t.Fatal(err)
-	}
-	if variant == "AHKC-no-transfer" {
-		c.c.creditOwner.Store(true) // deterministic ablation: coordinator unavailable
 	}
 	namespaces := [2]*Namespace[string]{}
 	namespaces[0], _ = c.Namespace("a")
@@ -511,30 +525,22 @@ func runNativeReplay(t *testing.T, name, variant, digest string, events []replay
 		}
 	}
 	r.Published = int(c.Stats().FillPublished)
-	if variant == "AHKC-no-transfer" {
-		c.c.creditOwner.Store(false)
-	}
 	closeManual(t, c, executor)
 	return r
 }
 
 func measureReplayForecast(c *Cache[string], namespaces [2]*Namespace[string], events []replayEvent, at int, r *replayResult) {
 	t := c.c.now()
-	duration := min(int64(c.c.cfg.HorizonW), int64(namespaces[0].ns.cfg.TTL), int64(len(events)-1-at)*int64(100*time.Microsecond))
+	duration := min(int64(c.c.cfg.Evict.Horizon), int64(namespaces[0].ns.cfg.TTL), int64(len(events)-1-at)*int64(100*time.Microsecond))
 	if duration <= 0 {
 		return
 	}
 	for id := 0; id < 16; id++ {
-		ns := namespaces[id%2].ns
-		hash := ns.hashKey(replayKey(id))
-		s := c.c.shardOf(hash)
-		config := ns.cfg
-		config.Prior = ns.prior.Load()
-		model := ns.model.Load().m
-		e := s.stats.estimate(estimateItem{policyHash: policyHash(hash, ns.gen.Load()), hardDeadline: t + duration, costClass: uint32(id % 4)}, t, &config, model, &c.c.cfg)
-		if e.mode == estUnavailable {
+		heat, ok := namespaces[id%2].Heat(replayKey(id))
+		if !ok {
 			continue
 		}
+		g := c.c.heatValue(heat, float32(replayCosts[id%4]), t+duration, t)
 		future := 0
 		for i := at + 1; i < len(events) && int64(i-at)*int64(100*time.Microsecond) <= duration; i++ {
 			if events[i].invalidate == id%2 {
@@ -545,35 +551,38 @@ func measureReplayForecast(c *Cache[string], namespaces [2]*Namespace[string], e
 			}
 		}
 		actual := float64(future) * replayCosts[id%4]
-		r.PredictionAbsError += math.Abs(e.G - actual)
+		r.PredictionAbsError += math.Abs(g - actual)
 		r.FutureCost += actual
 		r.PredictionChecks++
-		if e.mode == estPrior {
-			r.PriorPredictions++
-		}
 	}
 }
 
+// 默认只把六类流量回放给 AHKC 本身，断言资源上限、IO 归零与加载结算（库的不变量）。
+// 设置 AHKC_REPLAY_REPORT 才会额外运行四个参考策略并写出对比报告：它们是对照用的顺序模型，
+// 不守护库的正确性，所以平时不跑。
 func TestSyntheticPolicyReplay(t *testing.T) {
+	report := os.Getenv("AHKC_REPLAY_REPORT")
 	count := 256
-	if os.Getenv("AHKC_REPLAY_REPORT") != "" {
+	if report != "" {
 		count = 20000
 	}
 	var results []replayResult
 	for _, scenario := range []string{"zipf", "scan", "hot-shift", "uniform-size-cost", "short-ttl", "namespace-invalidation"} {
 		events, digest := makeReplayTrace(scenario, count)
-		for _, policy := range []string{"LRU", "SIEVE", "S3-FIFO", "W-TinyLFU-AV"} {
-			results = append(results, runReferenceReplay(t, scenario, policy, digest, events))
+		if report != "" {
+			for _, policy := range []string{"LRU", "SIEVE", "S3-FIFO", "W-TinyLFU-AV"} {
+				results = append(results, runReferenceReplay(t, scenario, policy, digest, events))
+			}
 		}
 		variants := []string{"AHKC"}
 		if count > 256 {
-			variants = append(variants, "AHKC-low-sampling", "AHKC-m1", "AHKC-low-gate", "AHKC-4shards", "AHKC-no-transfer")
+			variants = append(variants, "AHKC-m1", "AHKC-low-gate", "AHKC-4shards")
 		}
 		for _, variant := range variants {
 			results = append(results, runNativeReplay(t, scenario, variant, digest, events))
 		}
 	}
-	if path := os.Getenv("AHKC_REPLAY_REPORT"); path != "" {
+	if path := report; path != "" {
 		report := struct {
 			Seed                           int64
 			Model, Scope, Limits           string
@@ -591,7 +600,11 @@ func TestSyntheticPolicyReplay(t *testing.T) {
 	}
 }
 
+// 校验报告里 W-TinyLFU-AV 参考模型本身的老化与 AV 比较；它不测库，只在出报告时才有意义。
 func TestReplayTinyLFUAgingAndAV(t *testing.T) {
+	if os.Getenv("AHKC_REPLAY_REPORT") == "" {
+		t.Skip("reference-model check; runs with AHKC_REPLAY_REPORT")
+	}
 	var f replayTiny
 	f.add(1, 0)
 	if f.frequency(1, 0) != 1 {
@@ -645,8 +658,8 @@ func TestBoundedSearchAgainstFullResidentOracle(t *testing.T) {
 			q[i] = victimInfo{id: uint64(i + 1), billed: int64(1 + rng.Intn(8)), loss: float64(rng.Intn(50) - 5)}
 			bytes += q[i].billed
 		}
-		s := fillSnapshot{q: q, aBytes: int64(1 + rng.Intn(16)), n: 12, bytes: bytes, countQuota: 12, byteQuota: bytes, countMax: 12,
-			retiredBytesAvail: bytes, retiredRecordSlots: 8, removalWorkLeft: 8, installWithoutQ: true, wheelOK: true, maxChecks: 256}
+		s := fillSnapshot{q: q, aBytes: int64(1 + rng.Intn(16)), n: 12, bytes: bytes, countQuota: 12, byteQuota: bytes,
+			installWithoutQ: true, maxChecks: 256}
 		if trial%5 == 0 {
 			s.installWithoutQ = false
 			s.installMask = 1 << 11

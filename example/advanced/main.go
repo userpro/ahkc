@@ -14,12 +14,18 @@ type document struct{ Body []byte }
 func main() {
 	ctx := context.Background()
 	clock, executor := ahkc.NewManualClock(int64(time.Second)), ahkc.NewManualExecutor()
-	c, err := ahkc.New[document](ahkc.Config{
-		ShardCount: 1, MaxEntries: 64, MaxResidentBytes: 4 << 20,
-		Clock: clock, Executor: executor, DisableTicker: true,
-	}, ahkc.WithWeigher(func(key string, v document) int64 {
-		return ahkc.EntryOverhead[document]() + int64(len(key)+cap(v.Body))
-	}), ahkc.WithResultMetadata(func(key string, _ document) ahkc.ResultMetadata {
+	c, err := ahkc.NewObject[document](ahkc.Config{
+		Shards:     1,
+		MaxEntries: 64,
+		MaxBytes:   4 << 20,
+		Runtime: ahkc.RuntimeConfig{
+			Clock:         clock,
+			Executor:      executor,
+			DisableTicker: true,
+		},
+	}, func(key string, v document) int64 {
+		return ahkc.EntryHeaderBytes + int64(len(key)+cap(v.Body))
+	}, ahkc.WithResultMetadata(func(key string, _ document) ahkc.ResultMetadata {
 		return ahkc.ResultMetadata{
 			NoCache:      key == "private",
 			HardDeadline: clock.Now() + int64(time.Second), // 只能缩短命名空间 TTL
@@ -28,15 +34,6 @@ func main() {
 	must(err)
 	ns, err := c.RegisterNamespace("docs", ahkc.NamespaceConfig{TTL: time.Minute, Tin: 1})
 	must(err)
-	must(ns.SetPrior(&ahkc.Prior{Lambda: 10}))
-	// MergeFactor=1 仅代表本例无并发合并的已知负载；生产应实测校准。
-	model, err := ahkc.NewCostTableModel(ahkc.CostTableConfig{
-		Clock: clock, Classes: 1, MergeFactor: 1,
-		DisableAutoObserve: true, FallbackCost: 0.01,
-	})
-	must(err)
-	model.ObserveLoad(0, 0.01, 10*time.Millisecond)
-	must(ns.SetModel(model))
 	drive := func() {
 		for i := 0; i < 32; i++ {
 			c.MaintenanceStep()
@@ -80,10 +77,6 @@ func main() {
 	must(err)
 	drive()
 	must(nsControl.Wait(ctx))
-	credits, ok := c.Credits()
-	if !ok || credits.CountGranted+credits.CountFree+credits.CountInTransit != credits.CountLimit {
-		panic("capacity ledger is inconsistent")
-	}
 	fmt.Printf("resident=%d managed_bound=%d\n", c.Stats().ResidentEntries, c.MemoryLimits().TotalBytes)
 
 	c.Shutdown()

@@ -32,11 +32,7 @@ func bruteForce(s *fillSnapshot) int64 {
 		needCount := max(int64(0), s.n+1-int64(s.oCount)-s.countQuota)
 		needBytes := max(int64(0), s.bytes+s.aBytes-s.oBytes-s.byteQuota)
 		if count < needCount || bytes < needBytes ||
-			s.n+1-int64(s.oCount)-count > s.countMax ||
-			s.oBytes+bytes > s.retiredBytesAvail ||
-			int64(s.oCount)+count > s.retiredRecordSlots ||
-			int64(s.oCount)+count > s.removalWorkLeft ||
-			(!s.installWithoutQ && mask&s.installMask == 0) || !s.wheelOK {
+			(!s.installWithoutQ && mask&s.installMask == 0) {
 			continue
 		}
 		slices.Sort(ids)
@@ -56,9 +52,8 @@ func baseSnapshot(q []victimInfo) *fillSnapshot {
 	return &fillSnapshot{
 		aBytes: 4, q: q,
 		n: 10, bytes: 40,
-		countQuota: 12, byteQuota: 44, countMax: 16,
-		retiredBytesAvail: 1 << 40, retiredRecordSlots: 16, removalWorkLeft: 16,
-		installWithoutQ: true, wheelOK: true, maxChecks: 256,
+		countQuota: 12, byteQuota: 44,
+		installWithoutQ: true, maxChecks: 256,
 	}
 }
 
@@ -161,14 +156,10 @@ func TestExactSelectGeneralConsistency(t *testing.T) {
 		s.bytes = int64(rng.Intn(60))
 		s.countQuota = 10
 		s.byteQuota = 44
-		s.retiredBytesAvail = int64(rng.Intn(30))
-		s.retiredRecordSlots = int64(rng.Intn(6))
-		s.removalWorkLeft = int64(rng.Intn(6))
 		s.installWithoutQ = rng.Intn(2) == 0
 		if !s.installWithoutQ {
 			s.installMask = uint64(rng.Int63n(1 << uint(m+1)))
 		}
-		s.wheelOK = rng.Intn(4) != 0
 		got := s.exactSelect()
 		want := bruteForce(s)
 		if got != want {
@@ -209,26 +200,6 @@ func TestStableIDTieBreak(t *testing.T) {
 	}
 	if math.IsNaN(s.q[0].loss) {
 		t.Fatal("unreachable")
-	}
-}
-
-// TestFastPathHonorsCountMax：快速路径 2 的条数缺口必须同时受 countMax 约束，
-// 与通用枚举 / 独立穷举一致（即便 countMax < countQuota 在现行维护流程中不可达）。
-func TestFastPathHonorsCountMax(t *testing.T) {
-	mk := func() *fillSnapshot {
-		s := baseSnapshot([]victimInfo{
-			{id: 1, billed: 4, loss: 3}, {id: 2, billed: 4, loss: 1}, {id: 3, billed: 4, loss: 2},
-		})
-		s.n, s.bytes, s.countQuota, s.byteQuota, s.countMax = 10, 40, 20, 100, 9
-		return s
-	}
-	s := mk()
-	got, want := s.exactSelect(), bruteForce(mk())
-	if got != want {
-		t.Fatalf("fast path mask=%d, brute force mask=%d", got, want)
-	}
-	if got < 0 || popcount(uint64(got)) != 2 {
-		t.Fatalf("n+1=11 exceeds countMax=9: need 2 victims, got mask=%d", got)
 	}
 }
 

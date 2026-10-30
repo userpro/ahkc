@@ -79,10 +79,10 @@ func TestHeatReadWeighted(t *testing.T) {
 }
 
 func TestHeatGateMinAndRows(t *testing.T) {
-	g := newHeatGate(4, 256)
+	g := newHeatGate(make([]heatCell, 1<<10))
 	key := uint64(0xdeadbeef)
 	for i := 0; i < 5; i++ {
-		g.add(key, 7, 64, 2)
+		g.add(key, 7)
 	}
 	h, ok := g.read(key, 7, 0)
 	if !ok || h < 5 {

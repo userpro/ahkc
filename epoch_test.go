@@ -25,6 +25,9 @@ func TestEpochPinUnpin(t *testing.T) {
 	if _, ok := d.pin(); ok {
 		t.Fatal("pin must be BUSY when slots exhausted")
 	}
+	if d.slotFull.Load() != 1 || d.retryFail.Load() != 0 {
+		t.Fatalf("failure counters: slotFull=%d retryFail=%d, want 1 and 0", d.slotFull.Load(), d.retryFail.Load())
+	}
 	for _, g := range gs {
 		g.unpin()
 	}
@@ -75,6 +78,30 @@ func TestEpochSafeForReclaim(t *testing.T) {
 	d.advanceStep(1)
 	if !d.safeForReclaim(0) {
 		t.Fatal("two advances required")
+	}
+}
+
+// retireEpoch 在条目头里只存低 32 位，用有符号差比较：差 >= 2 才安全；
+// 回绕后仍正确，差为负（含被多挡 2^31 个 epoch 以上）时保守判不安全，永远不会提前。
+func TestSafeForReclaimWrapsAt32Bits(t *testing.T) {
+	d := newEpochDomain(1)
+	for _, c := range []struct {
+		cur    uint64
+		retire uint32
+		safe   bool
+	}{
+		{0, 0, false}, {1, 0, false}, {2, 0, true},
+		{1<<32 - 1, 1<<32 - 1, false},
+		{1 << 32, 1<<32 - 1, false},  // 回绕后差 1
+		{1<<32 + 1, 1<<32 - 1, true}, // 回绕后差 2
+		{1<<32 + 5, 1<<32 - 1, true}, // 回绕后差 6
+		{5, 10, false},               // 退休点在“未来”：不会发生，保守判不安全
+		{1<<31 + 5, 1, false},        // 被多挡了 2^31 个 epoch 以上：保守判不安全
+	} {
+		d.epoch.Store(c.cur)
+		if got := d.safeForReclaim(c.retire); got != c.safe {
+			t.Fatalf("epoch %d retire %d: safe=%v, want %v", c.cur, c.retire, got, c.safe)
+		}
 	}
 }
 

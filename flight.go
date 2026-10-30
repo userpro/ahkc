@@ -2,10 +2,10 @@ package ahkc
 
 import (
 	"context"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 // Flight：受限回源合并状态机。
@@ -40,7 +40,7 @@ type sourceOutcome[V any] struct {
 	cached          *Handle[V]
 	billedBytes     int64
 	hardDeadline    int64
-	costClass       uint32
+	cost            float32
 	cacheable       bool
 }
 
@@ -49,6 +49,7 @@ type flight[V any] struct {
 	key          string
 	keyHash      uint64
 	nsID         uint32
+	shadowHit    bool // 影子缓存：leader 已虚拟命中，真实缓存不会加载，故不填充。shortcut: follower 沿用 leader 的判定，条目恰在飞行中过期时少填一次，无害（下次请求重填）
 	shardID      int
 	stripeID     int
 	registered   atomic.Bool
@@ -301,8 +302,8 @@ func (c *cache[V]) getOrLoad(r *Request[V], loader Loader[V]) (future *Future[V]
 	f := &flight[V]{
 		key: strings.Clone(r.key), keyHash: r.keyHash, nsID: r.ns.id, shardID: r.sh.id, stripeID: stripeID,
 		flightID: flightID,
-		tok:      tok, expected: expected,
-		loadDeadline:  now + int64(c.cfg.LoadTimeout),
+		tok:      tok, expected: expected, shadowHit: r.shadowHit,
+		loadDeadline:  now + int64(c.cfg.Limits.LoadTimeout),
 		validityBase:  now, // 保守 TTL 基准：不晚于 loader 开始
 		phase:         phaseLoading,
 		reuseDeadline: 0,
@@ -323,7 +324,10 @@ func (c *cache[V]) getOrLoad(r *Request[V], loader Loader[V]) (future *Future[V]
 	rr := c.readOwned(r)
 	if rr.status == readHit {
 		// 已有有效值：交付缓存命中句柄，释放未使用的加载额度。
-		oc := &sourceOutcome[V]{kind: outcomeCached, value: rr.handle.Value(), cached: rr.handle, realCompletedAt: c.now()}
+		// 字节布局的视图在句柄释放后失效：先拷出再立即释放，交付结果不持有指向块内的视图。
+		v := c.copyOut(rr.handle.e)
+		rr.handle.Release()
+		oc := &sourceOutcome[V]{kind: outcomeCached, value: v, realCompletedAt: c.now()}
 		c.finishSource(f, oc)
 		return w, nil
 	}
@@ -360,7 +364,6 @@ func (c *cache[V]) runLoader(f *flight[V], loader Loader[V]) {
 	f.sourceStarted.Store(true)
 	c.metrics.loads.Add(1)
 	c.observeLoad(f, now)
-	startedAt := c.now()
 	ns := c.nsByID(f.nsID)
 	completed := false
 	func() {
@@ -395,8 +398,9 @@ func (c *cache[V]) runLoader(f *flight[V], loader Loader[V]) {
 			oc.value = zero
 			return
 		}
+		f.respRc.shrinkTo(oc.billedBytes) // 创建时按 MaxResultBytes 预留；结果已知后只占实际大小
 		oc.hardDeadline = f.validityBase + int64(ns.cfg.TTL)
-		oc.costClass = ns.cfg.CostClass
+		oc.cost = 1
 		oc.cacheable = true
 		if c.metadata != nil {
 			metadata := c.metadata(f.key, v)
@@ -404,22 +408,17 @@ func (c *cache[V]) runLoader(f *flight[V], loader Loader[V]) {
 			if metadata.HardDeadline > 0 && metadata.HardDeadline < oc.hardDeadline {
 				oc.hardDeadline = metadata.HardDeadline
 			}
-			if metadata.CostClass != nil {
-				oc.costClass = *metadata.CostClass
+			if metadata.Cost != 0 {
+				if c := metadata.Cost; !(c > 0) || math.IsInf(float64(c), 0) {
+					oc.cacheable = false // 非法成本不入缓存，避免毒化收益比较
+				} else {
+					oc.cost = c
+				}
 			}
 		}
 	}()
 	if !completed {
 		oc.realCompletedAt = c.now()
-	}
-	// 慢路径成本观测：按命名空间/有限成本类别老化。
-	// 默认口径为墙钟时长；严格 CPU 口径由宿主 Observe 提供。
-	if oc.kind == outcomeLoaded {
-		if ns != nil {
-			if obs, okYes := ns.model.Load().m.(costObserver); okYes {
-				obs.observeDuration(oc.costClass, time.Duration(oc.realCompletedAt-startedAt))
-			}
-		}
 	}
 	c.finishSource(f, oc)
 }
@@ -454,7 +453,7 @@ func (c *cache[V]) tryAttachWaiterLocked(r *Request[V], f *flight[V]) *Future[V]
 		dst++
 	}
 	f.waiters = f.waiters[:dst]
-	if len(f.waiters) >= c.cfg.MaxWaitersPerKey {
+	if len(f.waiters) >= c.cfg.Limits.MaxWaitersPerKey {
 		return nil
 	}
 	w, fr := newFutureReserving[V](&c.waiterBudget, f.loadDeadline)
@@ -703,7 +702,7 @@ func (c *cache[V]) pickFlightWorkLocked(f *flight[V], s *shard[V]) {
 			}
 			hardDeadline := d.outcome.hardDeadline
 			deadline := hardDeadline
-			if hd := d.outcome.realCompletedAt + int64(c.cfg.HandoffTimeout); hd < deadline {
+			if hd := d.outcome.realCompletedAt + int64(c.cfg.Limits.HandoffTimeout); hd < deadline {
 				deadline = hd
 			}
 			f.setWork(flightWork[V]{

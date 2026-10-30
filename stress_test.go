@@ -16,21 +16,23 @@ import (
 // 容量不变量（I1）与预算守恒（I2）。
 func TestConcurrentMixedStress(t *testing.T) {
 	cfg := Config{
-		ShardCount:         16,
-		MaxEntries:         512,
-		MaxResidentBytes:   4 << 20,
-		SampleP:            1.0 / 64,
-		MaxConcurrentLoads: 32,
-		LoadTimeout:        500 * time.Millisecond,
-		HandoffTimeout:     200 * time.Millisecond,
-		MaxTTL:             5 * time.Second,
-		PeriodicInterval:   5 * time.Millisecond,
+		Shards:     16,
+		MaxEntries: 512,
+		MaxBytes:   4 << 20,
 		Namespaces: map[string]NamespaceConfig{
-			"a": {TTL: 2 * time.Second, Tin: 2, Prior: &Prior{Lambda: 50}},
+			"a": {TTL: 2 * time.Second, Tin: 2},
 			"b": {TTL: 3 * time.Second, Tin: 3},
-		}, Advanced: Advanced{WheelTick: 10 * time.Millisecond, WheelSlots: 64, WheelLevels: 4},
+		},
+		Limits: LimitsConfig{
+			MaxConcurrentLoads: 32,
+			LoadTimeout:        500 * time.Millisecond,
+			HandoffTimeout:     200 * time.Millisecond,
+		},
+		Runtime: RuntimeConfig{
+			PeriodicInterval: 5 * time.Millisecond,
+		},
 	}
-	c, err := New[string](cfg)
+	c, err := NewBytes[string](cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +117,6 @@ func TestConcurrentMixedStress(t *testing.T) {
 	checkAvail("waiter", c.c.waiterBudget.available(), c.c.waiterBudget.limit)
 	checkAvail("pendingBytes", c.c.pendingBytes.available(), c.c.pendingBytes.limit)
 	checkAvail("responseBytes", c.c.responseBytes.available(), c.c.responseBytes.limit)
-	checkAvail("retiredBytes", c.c.retiredBytes.available(), c.c.retiredBytes.limit)
 
 	// 关闭后预算守恒（I2）：所有额度归还。
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -135,9 +136,6 @@ func TestConcurrentMixedStress(t *testing.T) {
 	if av := c.c.responseBytes.available(); av != c.c.responseBytes.limit {
 		t.Fatalf("I2: responseBytes not conserved: %d/%d", av, c.c.responseBytes.limit)
 	}
-	if av := c.c.retiredBytes.available(); av != c.c.retiredBytes.limit {
-		t.Fatalf("I2: retiredBytes not conserved: %d/%d", av, c.c.retiredBytes.limit)
-	}
 	if st.FillPublished == 0 || st.Loads == 0 {
 		t.Fatalf("stress did no work: %+v", st)
 	}
@@ -146,11 +144,15 @@ func TestConcurrentMixedStress(t *testing.T) {
 // TestCloseReclaimsUnderLoad 关闭与在途加载交错：Close 返回 nil 即 RECLAIMED。
 func TestCloseReclaimsUnderLoad(t *testing.T) {
 	cfg := Config{
-		ShardCount: 4, MaxEntries: 64, MaxResidentBytes: 1 << 20, MaxTTL: 5 * time.Second,
-		PeriodicInterval: 2 * time.Millisecond,
-		Namespaces:       map[string]NamespaceConfig{"t": {TTL: 2 * time.Second, Tin: 2, Prior: &Prior{Lambda: 10}}}, Advanced: Advanced{WheelTick: 10 * time.Millisecond, WheelSlots: 64, WheelLevels: 4},
+		Shards:     4,
+		MaxEntries: 64,
+		MaxBytes:   1 << 20,
+		Namespaces: map[string]NamespaceConfig{"t": {TTL: 2 * time.Second, Tin: 2}},
+		Runtime: RuntimeConfig{
+			PeriodicInterval: 2 * time.Millisecond,
+		},
 	}
-	c, err := New[string](cfg)
+	c, err := NewBytes[string](cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

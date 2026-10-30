@@ -3,6 +3,7 @@ package ahkc
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -14,19 +15,29 @@ import (
 
 func validConfig() Config {
 	return Config{
-		ShardCount:       4,
-		MaxEntries:       64,
-		MaxResidentBytes: 1 << 20,
-		HeatDelta:        time.Second,
-		ValueDelta:       10 * time.Second,
-		DisableTicker:    true,
-		Executor:         NewManualExecutor(),
-		Clock:            NewManualClock(1_000_000_000),
-		FillRatePerSec:   1e6,
+		Shards:     4,
+		MaxEntries: 64,
+		MaxBytes:   1 << 20,
 		Namespaces: map[string]NamespaceConfig{
-			"t": {TTL: time.Minute, Tin: 2, Tout: 1, Prior: testPrior},
-		}, Advanced: Advanced{WheelTick: 100 * time.Millisecond, WheelSlots: 16, WheelLevels: 4},
+			"t": {TTL: time.Minute, Tin: 2},
+		},
+		Heat: HeatConfig{
+			Delta: time.Second,
+		},
+		Runtime: RuntimeConfig{
+			DisableTicker: true,
+			Executor:      NewManualExecutor(),
+			Clock:         NewManualClock(1_000_000_000),
+		},
 	}
+}
+
+// smallConfig 是 validConfig 的变体：指定分片数与条目额度，命名空间 "t" 的准入阈值为 1（首次请求即有资格）。
+func smallConfig(shards int, entries int64) Config {
+	cfg := validConfig()
+	cfg.Shards, cfg.MaxEntries = shards, entries
+	cfg.Namespaces["t"] = NamespaceConfig{TTL: time.Minute, Tin: 1}
+	return cfg
 }
 
 // TestConfigValidationRejects 覆盖 validate 的全部可达拒绝分支：
@@ -37,52 +48,30 @@ func TestConfigValidationRejects(t *testing.T) {
 		mutate func(*Config)
 	}{
 		{"MaxEntries<=0", func(c *Config) { c.MaxEntries = 0 }},
-		{"MaxResidentBytes<=0", func(c *Config) { c.MaxResidentBytes = 0 }},
-		{"MaxEntries<ShardCount", func(c *Config) { c.MaxEntries = 2 }},
-		{"HeatCap超位宽", func(c *Config) { c.HeatCap = heatCountMax + 1 }},
-		{"VictimLimit>8", func(c *Config) { c.VictimLimit = 9 }},
-		{"MaxSubsetChecks>2^VictimLimit", func(c *Config) { c.VictimLimit = 3; c.MaxSubsetChecks = 16 }},
-		{"Grace<2HeatDelta", func(c *Config) { c.Grace = time.Second }},
-		{"ColdFor<HeatDelta", func(c *Config) { c.ColdFor = time.Millisecond }},
-		{"SampleP>1", func(c *Config) { c.SampleP = 1.5 }},
-		{"时间轮跨度不足", func(c *Config) { c.MaxTTL = 24 * time.Hour }},
-		{"时间轮跨度恰差滞后边界一tick", func(c *Config) {
-			// K^L*tick=1.6s；旧公式要求 1.1s+(4+1)*tick=1.6s 通过，但最大 delta 恰等于 K^L 不可调度。
-			c.WheelSlots, c.WheelLevels, c.MaxWheelLag = 4, 2, 4
-			c.MaxTTL, c.HandoffTimeout = 1100*time.Millisecond, 500*time.Millisecond
-			c.Namespaces["t"] = NamespaceConfig{TTL: time.Second, Tin: 2, Tout: 1, Prior: testPrior}
-		}},
-		{"RetireBytesPerRound<MaxEntryBytes", func(c *Config) {
-			c.RetireBytesPerRound, c.ReclaimBytesPerRound = 1, 1<<20
-		}},
-		{"HandoffTimeout>=MaxTTL", func(c *Config) { c.HandoffTimeout = time.Hour }},
-		{"MaxEntryBytes>MaxResidentBytes", func(c *Config) { c.MaxEntryBytes = 2 << 20 }},
-		{"PendingBytes<MaxEntryBytes", func(c *Config) { c.PendingBytes = 1; c.MaxEntryBytes = 1 << 10 }},
-		{"RetiredBytes<MaxEntryBytes", func(c *Config) { c.RetiredBytes = 1; c.MaxEntryBytes = 1 << 10 }},
-		{"ResponseBytes<MaxResultBytes", func(c *Config) { c.ResponseBytes = 1; c.MaxResultBytes = 4096 }},
-		{"GateEpsilon未成对", func(c *Config) { c.GateEpsilon = 0.001 }},
-		{"GateDelta越界", func(c *Config) { c.GateEpsilon = 0.001; c.GateDelta = 1.5 }},
-		{"GateWidth超上界", func(c *Config) { c.GateWidth = 1<<22 + 1 }},
-		{"HotHistoryWindows负值", func(c *Config) { c.HotHistoryWindows = -1 }},
-		{"HotHistory缺tracker", func(c *Config) { c.HotHistoryWindows = 2 }},
-		{"OnHotWindow缺tracker", func(c *Config) { c.OnHotWindow = func(HotSnapshot) {} }},
+		{"MaxBytes<=0", func(c *Config) { c.MaxBytes = 0 }},
+		{"MaxEntries<Shards", func(c *Config) { c.MaxEntries = 2 }},
+		{"VictimLimit>8", func(c *Config) { c.Evict.VictimLimit = 9 }},
+		{"MaxEntryBytes>MaxBytes", func(c *Config) { c.MaxEntryBytes = 2 << 20 }},
+		{"PendingBytes<MaxEntryBytes", func(c *Config) { c.Limits.PendingBytes = 1; c.MaxEntryBytes = 1 << 10 }},
+		{"ResponseBytes<MaxResultBytes", func(c *Config) { c.Limits.ResponseBytes = 1; c.MaxResultBytes = 4096 }},
+		{"GateCells超上界", func(c *Config) { c.Heat.GateCells = 1<<26 + 1 }},
+		{"MaxKeyBytes超16位长度", func(c *Config) { c.MaxKeyBytes = 1 << 16 }},
+		{"MaxResultBytes超32位计费", func(c *Config) { c.MaxResultBytes = 1 << 32 }},
+		{"MaxOwnedPinsPerEntry超32位计数", func(c *Config) { c.Limits.MaxOwnedPinsPerEntry = 1<<30 + 1 }},
+		{"Hot.Windows负值", func(c *Config) { c.Hot.Windows = -1 }},
+		{"HotHistory缺tracker", func(c *Config) { c.Hot.Windows = 2 }},
+		{"Hot.OnWindow缺tracker", func(c *Config) { c.Hot.OnWindow = func(HotSnapshot) {} }},
 		{"命名空间缺TTL", func(c *Config) {
 			c.Namespaces["t"] = NamespaceConfig{Tin: 2}
 		}},
-		{"命名空间TTL>MaxTTL", func(c *Config) {
-			c.Namespaces["t"] = NamespaceConfig{TTL: 2 * time.Hour, Tin: 2}
-		}},
-		{"命名空间Tout>=Tin", func(c *Config) {
-			c.Namespaces["t"] = NamespaceConfig{TTL: time.Minute, Tin: 2, Tout: 2}
-		}},
-		{"命名空间SampleP非法", func(c *Config) {
-			c.Namespaces["t"] = NamespaceConfig{TTL: time.Minute, SampleP: -1}
+		{"命名空间TTL>1年", func(c *Config) {
+			c.Namespaces["t"] = NamespaceConfig{TTL: 2 * maxTTL, Tin: 2}
 		}},
 	}
 	for _, tc := range cases {
 		cfg := validConfig()
 		tc.mutate(&cfg)
-		if _, err := New[string](cfg); !errors.Is(err, ErrInvalidConfig) {
+		if _, err := NewBytes[string](cfg); !errors.Is(err, ErrInvalidConfig) {
 			t.Errorf("%s: err=%v, want ErrInvalidConfig", tc.name, err)
 		}
 	}
@@ -100,47 +89,20 @@ func TestConfigValidateDefensiveBranches(t *testing.T) {
 			t.Errorf("%s: expected validation error", name)
 		}
 	}
-	check("HeatCap==0", func(c *Config) { c.HeatCap = 0 })
-	check("ShardCount非2的幂", func(c *Config) { c.ShardCount = 3 })
-	check("ProbeLimit<=0", func(c *Config) { c.ProbeLimit = 0 })
+	check("Shards非2的幂", func(c *Config) { c.Shards = 3 })
+	check("Memory.LoadFactor>1", func(c *Config) { c.Memory.LoadFactor = 1.5 })
 	// 合法基线必须通过（防御分支不误伤）。
 	cfg := validConfig()
 	cfg.applyDefaults()
-	cfg.HeatCap = defaultHeatCap(cfg) // New 在 validate 前补默认
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
 	}
 }
 
-// TestGateErrorBudgetDerivation 覆盖门卫误差预算推导：
-// 有效 ε/δ 对覆盖默认尺寸（w=⌈e/ε⌉、d=⌈ln(1/δ)⌉），端到端可创建。
-func TestGateErrorBudgetDerivation(t *testing.T) {
-	cfg := validConfig()
-	cfg.GateEpsilon = 0.001
-	cfg.GateDelta = 0.001
-	cfg.applyDefaults()
-	if cfg.GateWidth != 2719 || cfg.GateRows != 7 {
-		t.Fatalf("derived gate = %dx%d, want 7x2719", cfg.GateRows, cfg.GateWidth)
-	}
-	c, err := New[string](cfg)
-	if err != nil {
-		t.Fatalf("error-budget config rejected: %v", err)
-	}
-	if got := c.c.cfg; got.GateRows != 7 || got.GateWidth != 2719 {
-		t.Fatalf("runtime gate = %dx%d, want 7x2719", got.GateRows, got.GateWidth)
-	}
-	// 未设置 ε/δ 时保持既有默认 4x4096。
-	cfg = validConfig()
-	cfg.applyDefaults()
-	if cfg.GateRows != 4 || cfg.GateWidth != 4096 {
-		t.Fatalf("default gate = %dx%d, want 4x4096", cfg.GateRows, cfg.GateWidth)
-	}
-}
-
 // TestRegisterNamespaceErrors 覆盖命名空间注册的全部错误分支与上限。
 func TestRegisterNamespaceErrors(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 2, Prior: testPrior},
-		func(c *Config) { c.MaxNamespaces = 2 })
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 2},
+		func(c *Config) { c.Limits.MaxNamespaces = 2 })
 	nsCfg := NamespaceConfig{TTL: time.Minute, Tin: 2}
 	if _, err := env.c.RegisterNamespace("", nsCfg); err == nil {
 		t.Fatal("empty name must be rejected")
@@ -151,8 +113,8 @@ func TestRegisterNamespaceErrors(t *testing.T) {
 	if _, err := env.c.RegisterNamespace("x", NamespaceConfig{Tin: 2}); err == nil {
 		t.Fatal("missing TTL must be rejected")
 	}
-	if _, err := env.c.RegisterNamespace("x", NamespaceConfig{TTL: 2 * time.Hour}); err == nil {
-		t.Fatal("TTL beyond MaxTTL must be rejected")
+	if _, err := env.c.RegisterNamespace("x", NamespaceConfig{TTL: 2 * maxTTL}); err == nil {
+		t.Fatal("TTL beyond the 1-year cap must be rejected")
 	}
 	// 上限：初始 1 个 + 新注册 1 个 = MaxNamespaces(2)。
 	ns2, err := env.c.RegisterNamespace("x", nsCfg)
@@ -174,7 +136,7 @@ func TestRegisterNamespaceErrors(t *testing.T) {
 // TestInvalidateNamespaceErrors 覆盖命名空间失效入口的错误分支：
 // 未知命名空间 / 队列满 BUSY / 关闭后 ErrClosed。
 func TestInvalidateNamespaceErrors(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 2, Prior: testPrior}, nil)
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 2}, nil)
 	if err := env.c.InvalidateNamespace(context.Background(), "nope"); !errors.Is(err, ErrNoSuchNamespace) {
 		t.Fatalf("unknown namespace: %v", err)
 	}
@@ -191,9 +153,9 @@ func TestInvalidateNamespaceQueueFull(t *testing.T) {
 	ex := &toggleExecutor{}
 	ex.fail.Store(true)
 	cfg := validConfig()
-	cfg.ControlQueueSize = 1
-	cfg.Executor = ex
-	c, err := New[string](cfg)
+	cfg.Limits.ControlQueueSize = 1
+	cfg.Runtime.Executor = ex
+	c, err := NewBytes[string](cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,8 +186,24 @@ func TestInvalidateNamespaceQueueFull(t *testing.T) {
 func TestValidationErrorMessagesAreActionable(t *testing.T) {
 	cfg := validConfig()
 	cfg.MaxEntries = 0
-	_, err := New[string](cfg)
+	_, err := NewBytes[string](cfg)
 	if err == nil || !strings.Contains(err.Error(), "MaxEntries") {
 		t.Fatalf("error must name the offending field: %v", err)
+	}
+}
+
+// 32 位平台上区大小以 uintptr 保存：总预留超过地址空间必须被拒绝，而不是静默截断。
+// 64 位平台的上限由单区 32GiB 约束，这里只在 32 位下断言。
+func TestRegionBeyondAddressSpaceRejectedOn32Bit(t *testing.T) {
+	if strconv.IntSize != 32 {
+		t.Skip("only meaningful where int is 32 bits")
+	}
+	cfg := validConfig()
+	cfg.Shards, cfg.MaxEntries, cfg.MaxBytes = 1, 1000, 4<<30
+	if c, err := NewBytes[string](cfg); err == nil {
+		_ = c.Close(context.Background())
+		t.Fatal("a 4GiB region must be rejected on a 32-bit platform")
+	} else if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("want ErrInvalidConfig, got %v", err)
 	}
 }

@@ -37,6 +37,10 @@ type epochDomain struct {
 	scanEpoch   uint64
 	scanCursor  int
 	scanBlocked bool
+
+	// 仅 pin 失败路径写入（独占缓存行，不影响命中路径）：槽耗尽次数 / epoch 连续推进致重试耗尽次数。
+	_                   [cacheLineSize]byte
+	slotFull, retryFail atomic.Uint64
 }
 
 func newEpochDomain(readers int) *epochDomain {
@@ -82,9 +86,11 @@ func (d *epochDomain) pin() (guard, bool) {
 			}
 		}
 		if !gotSlot {
+			d.slotFull.Add(1)
 			return guard{}, false // 无保护槽：BUSY，不无界分配
 		}
 	}
+	d.retryFail.Add(1)
 	return guard{}, false
 }
 
@@ -121,11 +127,17 @@ func (d *epochDomain) advanceStep(quota int) int {
 }
 
 // safeForReclaim 判断 retireEpoch 退休的对象是否满足两代 epoch 条件。
-func (d *epochDomain) safeForReclaim(retireEpoch uint64) bool {
-	if retireEpoch > math.MaxUint64-2 {
+//
+// retireEpoch 只存 epoch 的低 32 位，用有符号差比较：差在 [2, 2^31) 时才安全，早于 2 代或回绕后的
+// 差值落在 [2^31, 2^32) 都判为不安全（只会推迟回收，不会提前）。
+// shortcut: 一个条目在退休链上停留超过 2^31 个 epoch（每个 epoch 至少一个维护周期）才会被多挡一圈，
+// 实际不可能；需要更强保证时把 retireEpoch 改回 64 位。
+func (d *epochDomain) safeForReclaim(retireEpoch uint32) bool {
+	cur := d.epoch.Load()
+	if cur > math.MaxUint64-2 {
 		return d.noReaders() // admission has stopped; the final domain cannot advance
 	}
-	return d.epoch.Load() >= retireEpoch+2
+	return int32(uint32(cur)-retireEpoch) >= 2
 }
 
 func (d *epochDomain) noReaders() bool {

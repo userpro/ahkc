@@ -16,62 +16,40 @@ import (
 // 结果大小受 MaxResultBytes 契约约束。
 type Loader[V any] func(ctx context.Context, key string) (V, error)
 
-// Weigher 计算条目完整计费大小 b：必须包含 key、value 保留容量与元数据上界，
-// 且跨条目可相加。
-type Weigher[V any] func(key string, value V) int64
-
 // ResultMetadata can only shorten cache validity or refuse caching.
 // HardDeadline uses the cache Clock's monotonic nanoseconds; zero uses namespace TTL.
 // NewMonotonicClock shares the default clock's origin. Negative deadlines refuse caching.
-// A nil CostClass uses the namespace default.
+// Cost 是该结果的单次回源成本，用于缩放收益（热度 × Cost × 剩余有效期）；
+// 0 表示默认值 1，须有限且不小于 0。
 type ResultMetadata struct {
 	NoCache      bool
 	HardDeadline int64
-	CostClass    *uint32
+	Cost         float32
 }
 
-// EntryOverhead is the entry's inline storage, including V's inline fields.
-// Custom weighers add the complete key and all referenced value allocations.
-func EntryOverhead[V any]() int64 { return int64(unsafe.Sizeof(entry[V]{})) }
+func roundUp8(n int64) int64 { return (n + 7) &^ 7 }
 
-// DefaultWeigher covers strings, byte buffers and flat values without references.
-// Pointer graphs require WithWeigher. Strings/buffers must own their backing
-// allocation; a substring/subslice retaining a larger allocation needs a custom
-// weight. The fixed entry header is charged conservatively as well.
-func DefaultWeigher[V any](key string, value V) int64 {
-	meta := EntryOverhead[V]()
-	var vs int64
-	switch x := any(value).(type) {
-	case string:
-		vs = int64(len(x))
-	case []byte:
-		vs = int64(cap(x))
-	default:
-		typ := reflect.TypeOf(value)
-		if typ != nil {
-			switch {
-			case typ.Kind() == reflect.String:
-				vs = int64(reflect.ValueOf(value).Len())
-			case typ.Kind() == reflect.Slice && typ.Elem().Kind() == reflect.Uint8:
-				vs = int64(reflect.ValueOf(value).Cap())
-			case flatValueType(typ):
-				// Inline value storage is already included in the entry header.
-			default:
-				return 0 // no arbitrary 64-byte guess for a retained object graph
-			}
-		}
-	}
-	return int64(len(key)) + vs + meta
+// blockBytes 是条目块的计费大小：头 + 按 8 字节对齐的 key + 按 8 字节对齐的 value。
+func blockBytes(keyLen int, valueLen int64) int64 {
+	return EntryHeaderBytes + roundUp8(int64(keyLen)) + roundUp8(valueLen)
 }
 
-// defaultWeighable 报告 DefaultWeigher 能否为 V 给出正权重。接口类型按动态值计费，放行。
-func defaultWeighable(t reflect.Type) bool {
-	switch {
-	case t.Kind() == reflect.Interface, t.Kind() == reflect.String,
-		t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8:
-		return true
-	}
-	return flatValueType(t)
+// valueLayout 是值的存放方式，由构造函数在创建时确定，运行期不做反射。
+type valueLayout uint8
+
+const (
+	layoutBytes  valueLayout = iota // string / []byte：内容的原始字节
+	layoutFlat                      // 无指针定长类型：内存映像
+	layoutObject                    // 任意对象：保留在 Go 堆上，调用方给出计费
+)
+
+func bytesWeigh[V ~string | ~[]byte](key string, v V) int64 {
+	return blockBytes(len(key), int64(len(v)))
+}
+
+func flatWeigh[V any](key string, _ V) int64 {
+	var zero V
+	return blockBytes(len(key), int64(unsafe.Sizeof(zero)))
 }
 
 func flatValueType(t reflect.Type) bool {
@@ -99,6 +77,9 @@ const (
 	cacheReclaimed
 )
 
+// hintSlots 是每分片过期提示槽数，须为 2 的幂且不超过 64（按 keyHash 高 6 位散列）。
+const hintSlots = 64
+
 // token 是版本令牌：命名空间代际 + 分片 fillFence。
 //
 // 粒度说明：fillFence 是**分片级**计数器，任何一个 key 的 Invalidate 都会推进它，
@@ -112,37 +93,42 @@ type token struct {
 
 // namespace 是命名空间内部表示。
 type namespace[V any] struct {
-	id              uint32
-	name            string
-	c               *cache[V]
-	cfg             NamespaceConfig
-	gen             atomic.Uint64
-	prior           atomic.Pointer[Prior]
-	sampleThreshold uint64
-	sampleInvP      float64
-	// 请求热点追踪与收益采样共用同一次随机抽样（见 beginRequest）：u < sampleThreshold
-	// 为收益样本，u < reqThreshold 为追踪样本，外层只比较 drawThreshold = max(两者)。
-	// 追踪关闭时 reqThreshold == 0、drawThreshold == sampleThreshold，分支结构不变。
-	drawThreshold uint64
-	reqThreshold  uint64
-	sampleAll     bool // SampleP >= 1：每个请求都是收益样本，不抽随机数
-	// model：版本化不可变模型快照；更新者原子发布。
-	model atomic.Pointer[modelHolder]
-}
-
-type modelHolder struct {
-	m     CostModel
-	since int64
+	id   uint32
+	name string
+	c    *cache[V]
+	cfg  NamespaceConfig
+	gen  atomic.Uint64
+	// reqThreshold 是请求热点追踪的采样阈值：u < reqThreshold 记为追踪样本；追踪关闭时为 0。
+	reqThreshold uint64
 }
 
 // shardCounters 是请求路径的分片条纹计数器（固定条带，不按 key 建指标）。
 // 独占缓存行，避免相邻分片计数器互相失效。
 type shardCounters struct {
-	hits    atomic.Uint64
-	misses  atomic.Uint64
-	busy    atomic.Uint64
-	samples atomic.Uint64
-	_       [32]byte
+	hits   atomic.Uint64
+	misses atomic.Uint64
+	busy   atomic.Uint64
+	_      [40]byte
+}
+
+// release 归还条目区与索引区，并清掉所有指向它们的指针：释放后仍被持有的 Cache 对象
+// 不能让 GC 看到悬空地址（内核可能把该地址段再分给 Go 堆）。构造失败时对半成品分片同样适用。
+func (s *shard[V]) release() {
+	s.reg.release()
+	s.idxReg.release()
+	if s.hot != nil {
+		s.hot.release()
+	}
+	if s.req != nil {
+		s.req.release()
+	}
+	if s.arena != nil {
+		s.arena.base = nil
+	}
+	if s.idx != nil {
+		s.idx.words = nil
+	}
+	s.gate.cells = nil
 }
 
 // shard 是分片。驻留结构和已提交账目仅维护者修改。
@@ -151,33 +137,36 @@ type shard[V any] struct {
 	c   *cache[V]
 	cnt shardCounters
 
-	idx           *index[V]
+	idx           *index
 	gate          heatGate
-	stats         *valueStats
-	hot           *hotTracker // 回源热点 key 追踪（可选，ObserveHotKeys > 0 时启用）
-	req           *reqTracker // 请求热点 key 追踪（可选，ObserveRequestKeys > 0 时启用）
-	stripes       []*sampleStripe
+	hot           *hotTracker // 回源热点 key 追踪（可选，Hot.LoadSlots > 0 时启用）
+	req           *reqTracker // 请求热点 key 追踪（可选，Hot.RequestSlots > 0 时启用）
 	flightStripes []flightStripe[V]
 	epoch         *epochDomain
-	pool          *entryPool[V]
-	policy        policyList[V]
-	wheel         *timerWheel[V]
+	policy        policyList
 
-	fillQueue       chan *fillCandidate[V]
-	runFn           func()                       // 预建的维护任务（避免每次调度分配闭包）
-	fs              fillScratch[V]               // 填充决策 scratch（仅维护者使用）
-	controlQueue    chan *controlOp[V]           // 失效确认：只含单 key 失效，不会被额度转移阻塞
-	creditQueue     chan *controlOp[V]           // 额度转移（Take / Apply）：取不到 creditOwner 时单独暂存，不挡失效
-	deferredControl atomic.Pointer[controlOp[V]] // creditQueue 队头因 creditOwner 繁忙而暂存的操作
+	// 条目区与索引区：New 时一次预留，RECLAIMED 后释放。arena 只由本分片维护者分配与释放。
+	reg, idxReg *region
+	arena       *arena
+	// 对象布局的值侧表（会被 GC 扫描）；槽号记在条目头的 valLen 里。仅维护者分配与归还。
+	// sideFree 只存回收的槽，sideNext 是从未用过的槽的起点：新槽按需取用，不在创建时触碰整张表。
+	side     []V
+	sideFree []uint32
+	sideNext uint32
+
+	fillQueue    chan *fillCandidate[V]
+	runFn        func()             // 预建的维护任务（避免每次调度分配闭包）
+	fs           fillScratch[V]     // 填充决策 scratch（仅维护者使用）
+	controlQueue chan *controlOp[V] // 单 key 失效确认
 
 	// 维护 owner 状态机：IDLE→QUEUED→RUNNING。
-	ownerState     atomic.Int32 // 0 IDLE 1 QUEUED 2 RUNNING
+	ownerState     atomic.Int32 // 0 IDLE 1 QUEUED 2 RUNNING 3 DEAD
 	pending        atomic.Bool
 	nextAllowedRun atomic.Int64
-	// pauseReasons 位：1=WHEEL_REBASE 2=EXECUTOR_REJECTED。
+	// pauseReasons 位：2=EXECUTOR_REJECTED。
 	pauseReasons atomic.Int32
 
-	// owner 字段（维护者独占；quota 用原子以允许协调者只读观测）。
+	// owner 字段（维护者独占；quota 创建时固定为公平份额，用原子便于观测）。
 	countQuota    atomic.Int64
 	byteQuota     atomic.Int64
 	residentCount atomic.Int64
@@ -188,36 +177,26 @@ type shard[V any] struct {
 	entrySeq  uint64 // owner
 
 	// owner 维护游标与配额
-	resumeClass      int
-	coldCursor       int
-	retiredScan      int
-	stripeDrain      int
-	flightScan       atomic.Uint64
-	fillTokens       float64
-	fillByteTokens   float64
-	lastRefill       int64
-	fillHead         atomic.Pointer[fillCandidate[V]]
-	roundActive      bool
-	roundDeadline    int64
-	retireWorkLeft   int64
-	retireBytesLeft  int64
-	reclaimBytesLeft int64
-	fillGain         atomic.Uint64 // float64 bits; the shard owner is the sole writer
-
-	countMax int64 // 分片物理上限 C_s^max
+	resumeClass int
+	// sweepCursor 是慢扫描的唯一游标：过期、代际失效与关闭共用。
+	sweepCursor   int
+	sweepAt       int64 // 上次慢扫描时刻，用于按流逝时间折算本轮扫描量
+	flightScan    atomic.Uint64
+	roundActive   bool
+	roundDeadline int64
+	fillGain      atomic.Uint64 // float64 bits; the shard owner is the sole writer
 
 	// 关闭（BEGIN_CLOSE 直接置位，维护者消费）
 	closeRequested atomic.Bool
-	closeCursor    int
 
-	// owner 退休列表（堆分配记录，受 retiredRecords 预算约束）。
-	retired []*retiredRecord[V]
-	// retiredCount 是 retired 的原子镜像，供 ticker 的 checkReclaimed 无锁读取。
-	retiredCount atomic.Int64
+	// hints 是读者发现的失效条目的有损提示：存索引槽号加一，维护者 Swap 取出并复核语义。
+	// 64 个槽按 keyHash 高位分散，零分配、不触发调度；丢失只会推迟退场，不影响读时校验。
+	hints [hintSlots]atomic.Uint32
 
-	// creditRequest：向协调者申请额度的标记（owner 设置，协调者消费）。
-	wantCredit     atomic.Bool
-	creditPendingN int64 // creditOwner protects grants not yet applied
+	// 侵入式退休链（owner 独占）；retiredCount 是其长度的原子镜像，供 checkReclaimed 无锁读取。
+	retireHead, retireTail blockRef
+	reclaimMore            bool // owner 独占：退休链非空且本轮回收有进展，立即续行
+	retiredCount           atomic.Int64
 }
 
 // currentToken 读取当前令牌（观测用）。
@@ -231,11 +210,12 @@ type Cache[V any] struct {
 }
 
 type cache[V any] struct {
-	cfg   Config
-	seed  maphash.Seed
-	weigh Weigher[V]
-	// customWeigher 为 true 表示调用方通过 WithWeigher 接管计费。
-	customWeigher bool
+	cfg    Config
+	seed   maphash.Seed
+	weigh  func(key string, value V) int64
+	layout valueLayout
+	// bytesIsString 区分字节布局的 V 是 string 还是 []byte（构造时按头部大小判定，运行期不做反射）。
+	bytesIsString bool
 	metadata      func(string, V) ResultMetadata
 	state         atomic.Int32
 	timeLimit     int64
@@ -248,16 +228,13 @@ type cache[V any] struct {
 	nsSnap atomic.Pointer[[]*namespace[V]]
 
 	// 分类预算。
-	ioBudget       budget // 真实 I/O 并发
-	waiterBudget   budget // 全局 waiter
-	pendingBytes   budget
-	responseBytes  budget
-	retiredBytes   budget
-	retiredRecords budget
-	retiredPool    *retiredPool[V]
-	controlBudget  budget
-	handleBudget   budget
-	memory         MemoryLimits
+	ioBudget      budget // 真实 I/O 并发
+	waiterBudget  budget // 全局 waiter
+	pendingBytes  budget
+	responseBytes budget
+	controlBudget budget
+	handleBudget  budget
+	memory        MemoryLimits
 
 	flightSeq          atomic.Uint64
 	admissions         atomic.Int64 // in-progress load/control admission, outside the Get hit path
@@ -266,22 +243,13 @@ type cache[V any] struct {
 	hotCallbackPending atomic.Bool
 	taskPool           *executorTaskPool
 
-	// 全局空闲额度（额度转移协调者持有；owner 只读观测）。
-	globalFreeCount   atomic.Int64
-	globalFreeBytes   atomic.Int64
-	creditInTransitN  atomic.Int64
-	creditInTransitB  atomic.Int64
-	creditSeq         atomic.Uint64
-	creditCursor      int
-	creditDonorCursor int
-	tickOwner         atomic.Bool
-	periodicCursor    int
+	tickOwner      atomic.Bool
+	periodicCursor int
 
 	nsControlQueue chan *controlOp[V]
 	nsCtlDraining  atomic.Bool
-	creditOwner    atomic.Bool
 
-	// hotHistory 热点窗口摘要历史（可选；HotHistoryWindows/OnHotWindow
+	// hotHistory 热点窗口摘要历史（可选；Hot.Windows/Hot.OnWindow
 	// 任一启用且存在追踪表时创建）。
 	hotHist *hotHistory
 	// 请求热点采样（全局同一采样率 q）：阈值与权重 1/q；reqThreshold == 0 表示未启用。
@@ -301,68 +269,76 @@ type cache[V any] struct {
 // Option 是可选配置项。
 type Option[V any] func(*cache[V])
 
-// WithWeigher 设置计费函数。
-func WithWeigher[V any](w Weigher[V]) Option[V] {
-	return func(c *cache[V]) { c.weigh, c.customWeigher = w, true }
-}
-
 // WithResultMetadata evaluates each successful load outside all internal gates.
 func WithResultMetadata[V any](metadata func(string, V) ResultMetadata) Option[V] {
 	return func(c *cache[V]) { c.metadata = metadata }
 }
 
-// New 创建缓存实例。配置不满足初始化约束时返回错误。
-func New[V any](cfg Config, opts ...Option[V]) (*Cache[V], error) {
+// NewBytes 创建字节串缓存：值是 string 或 []byte（含命名类型），存放内容的原始字节。
+// 配置不满足初始化约束时返回错误。
+func NewBytes[V ~string | ~[]byte](cfg Config, opts ...Option[V]) (*Cache[V], error) {
+	return newCache(cfg, layoutBytes, bytesWeigh[V], opts)
+}
+
+// NewFlat 创建定长值缓存：V 必须是不含指针的定长类型（数值、数组、无指针结构体），
+// 直接存放其内存映像，不需要序列化。含指针的类型请用 NewObject。
+func NewFlat[V any](cfg Config, opts ...Option[V]) (*Cache[V], error) {
+	if !flatValueType(reflect.TypeFor[V]()) {
+		return nil, fmt.Errorf("%w: NewFlat requires a pointer-free fixed-size type, use NewObject", ErrInvalidConfig)
+	}
+	return newCache(cfg, layoutFlat, flatWeigh[V], opts)
+}
+
+// NewObject 创建对象缓存：V 可以是任意类型，值保留在 Go 堆上（会被 GC 扫描）。
+// weigh 必填，必须返回条目的完整计费大小：EntryHeaderBytes + key + value 引用的全部内存，
+// 且大于 0。
+func NewObject[V any](cfg Config, weigh func(key string, value V) int64, opts ...Option[V]) (*Cache[V], error) {
+	if weigh == nil {
+		return nil, fmt.Errorf("%w: nil weigh", ErrInvalidConfig)
+	}
+	return newCache(cfg, layoutObject, weigh, opts)
+}
+
+func newCache[V any](cfg Config, layout valueLayout, weigh func(string, V) int64, opts []Option[V]) (*Cache[V], error) {
 	if err := validateNumbers(cfg); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
-	if cfg.GateEpsilon > 0 && math.Ceil(math.E/cfg.GateEpsilon) > 1<<22 {
-		return nil, fmt.Errorf("%w: GateEpsilon requires too many cells", ErrInvalidConfig)
-	}
-	if cfg.GateDelta > 0 && math.Ceil(-math.Log(cfg.GateDelta)) > 64 {
-		return nil, fmt.Errorf("%w: GateDelta requires too many rows", ErrInvalidConfig)
-	}
 	cfg.applyDefaults()
-	if cfg.HeatCap == 0 {
-		cfg.HeatCap = defaultHeatCap(cfg)
-	}
 	if err := cfg.validate(); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
-	c := &cache[V]{cfg: cfg, weigh: DefaultWeigher[V]}
+	c := &cache[V]{cfg: cfg, weigh: weigh, layout: layout}
+	if layout == layoutBytes {
+		var zero V
+		c.bytesIsString = unsafe.Sizeof(zero) == unsafe.Sizeof("")
+	}
 	for _, o := range opts {
 		if o == nil {
 			return nil, fmt.Errorf("%w: nil option", ErrInvalidConfig)
 		}
 		o(c)
 	}
-	if c.weigh == nil {
-		return nil, fmt.Errorf("%w: nil weigher", ErrInvalidConfig)
-	}
-	if !c.customWeigher && !defaultWeighable(reflect.TypeFor[V]()) {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, ErrNoWeigher)
-	}
-	layout, err := planLayout[V](cfg)
+	lay, err := planLayout[V](cfg, layout)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
-	if cfg.MaxManagedBytes == 0 {
-		cfg.MaxManagedBytes = layout.memory.TotalBytes
+	if cfg.Limits.MaxManagedBytes == 0 {
+		cfg.Limits.MaxManagedBytes = lay.memory.TotalBytes
 	}
 	timeLimit := maxCacheTime(cfg)
-	now := cfg.Clock.Now()
+	now := cfg.Runtime.Clock.Now()
 	if now < 0 || now >= timeLimit {
 		return nil, ErrExhausted
 	}
 	c.cfg = cfg
 	c.seed = maphash.MakeSeed()
 	c.nsByName = make(map[string]*namespace[V], len(cfg.Namespaces))
-	c.nsControlQueue = make(chan *controlOp[V], cfg.ControlQueueSize)
+	c.nsControlQueue = make(chan *controlOp[V], cfg.Limits.ControlQueueSize)
 	c.closedCh, c.drainedCh, c.stopTick = make(chan struct{}), make(chan struct{}), make(chan struct{})
-	c.timeLimit, c.memory = timeLimit, layout.memory
-	if cfg.ObserveRequestKeys > 0 { // q >= 1 时阈值取 MaxUint64（几乎必中）
+	c.timeLimit, c.memory = timeLimit, lay.memory
+	if cfg.Hot.RequestSlots > 0 { // q >= 1 时阈值取 MaxUint64（几乎必中）
 		c.reqThreshold, c.reqInvQ = math.MaxUint64, 1
-		if q := cfg.ObserveRequestSampleP; q < 1 {
+		if q := cfg.Hot.RequestSampleP; q < 1 {
 			c.reqThreshold = uint64(math.Ldexp(q, 64))
 			c.reqInvQ = math.Ldexp(1, 64) / float64(c.reqThreshold)
 		}
@@ -370,65 +346,74 @@ func New[V any](cfg Config, opts ...Option[V]) (*Cache[V], error) {
 	// 历史窗口按 Unix 时间对齐：内置时钟与 processClockBase 同原点，偏移精确；
 	// 自定义时钟从其原点对齐（测试确定）。
 	var hotAlign uint64
-	if _, ok := cfg.Clock.(*realClock); ok {
+	if _, ok := cfg.Runtime.Clock.(*realClock); ok {
 		hotAlign = uint64(processClockBase.UnixNano())
 	}
-	hotInterval := uint64(cfg.HotHistoryInterval)
-	hotWindowed := cfg.HotHistoryWindows > 0 || cfg.OnHotWindow != nil
-	c.ioBudget.init(int64(cfg.MaxConcurrentLoads))
-	c.waiterBudget.init(int64(cfg.MaxWaitersTotal))
-	c.handleBudget.init(int64(cfg.MaxOwnedHandles))
-	c.pendingBytes.init(cfg.PendingBytes)
-	c.responseBytes.init(cfg.ResponseBytes)
-	c.retiredBytes.init(cfg.RetiredBytes)
-	c.retiredRecords.init(int64(cfg.RetiredRecords))
-	c.controlBudget.init(int64(cfg.ShardCount+1) * int64(cfg.ControlQueueSize+1))
-	c.retiredPool = newRetiredPool[V](cfg.RetiredRecords)
-	c.taskPool = newExecutorTaskPool(c, cfg.MaxExecutorTasks)
-	// 分片额度均分，余量进入全局空闲池（A.9 守恒：Σ C_s + C_free + C_inTransit = C）。
-	perCount := cfg.MaxEntries / int64(cfg.ShardCount)
-	perBytes := cfg.MaxResidentBytes / int64(cfg.ShardCount)
-	c.globalFreeCount.Store(cfg.MaxEntries - perCount*int64(cfg.ShardCount))
-	c.globalFreeBytes.Store(cfg.MaxResidentBytes - perBytes*int64(cfg.ShardCount))
-	// 每分片索引槽数：按负载率预留，取 2 的幂。
-	countMax, slots := layout.countMax, layout.slots
-	c.shards = make([]*shard[V], cfg.ShardCount)
+	hotInterval := uint64(cfg.Hot.Interval)
+	hotWindowed := cfg.Hot.Windows > 0 || cfg.Hot.OnWindow != nil
+	c.ioBudget.init(int64(cfg.Limits.MaxConcurrentLoads))
+	c.waiterBudget.init(int64(cfg.Limits.MaxWaitersTotal))
+	c.handleBudget.init(int64(cfg.Limits.MaxOwnedHandles))
+	c.pendingBytes.init(cfg.Limits.PendingBytes)
+	c.responseBytes.init(cfg.Limits.ResponseBytes)
+	c.controlBudget.init(int64(cfg.Shards+1) * int64(cfg.Limits.ControlQueueSize+1))
+	c.taskPool = newExecutorTaskPool(c, cfg.Limits.MaxExecutorTasks)
+	// 分片额度固定为公平份额，余数分给前几个分片：Σ C_s = MaxEntries，Σ B_s = MaxBytes。
+	shards := int64(cfg.Shards)
+	perCount, remCount := cfg.MaxEntries/shards, cfg.MaxEntries%shards
+	perBytes, remBytes := cfg.MaxBytes/shards, cfg.MaxBytes%shards
+	c.shards = make([]*shard[V], cfg.Shards)
 	for i := range c.shards {
 		s := &shard[V]{
 			id:           i,
 			c:            c,
-			idx:          newIndex[V](slots, cfg.ProbeLimit),
-			gate:         newHeatGate(cfg.GateRows, cfg.GateWidth),
-			stats:        newValueStats(cfg.ValueRows, cfg.ValueWidth, now),
-			epoch:        newEpochDomain(cfg.ReaderSlotsPerShard),
-			pool:         newEntryPool[V](shardPoolSize(cfg, countMax)),
-			wheel:        newTimerWheel[V](int64(cfg.WheelTick), cfg.WheelLevels, cfg.WheelSlots, now),
-			stripes:      make([]*sampleStripe, cfg.SampleStripes),
-			fillQueue:    make(chan *fillCandidate[V], cfg.FillQueueSize),
-			controlQueue: make(chan *controlOp[V], cfg.ControlQueueSize),
-			creditQueue:  make(chan *controlOp[V], cfg.ControlQueueSize),
-			retired:      make([]*retiredRecord[V], 0, cfg.RetiredRecords),
+			epoch:        newEpochDomain(cfg.Limits.ReaderSlotsPerShard),
+			fillQueue:    make(chan *fillCandidate[V], cfg.Limits.FillQueueSize),
+			controlQueue: make(chan *controlOp[V], cfg.Limits.ControlQueueSize),
 		}
-		s.fs.init(cfg.VictimLimit)
+		fail := func(err error) (*Cache[V], error) { // 已建好的分片和本分片的半成品一并归还
+			s.release()
+			for _, done := range c.shards[:i] {
+				done.release()
+			}
+			return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+		}
+		var err error
+		if s.reg, err = newRegion(lay.regionBytes, cfg.Memory.Heap, cfg.Memory.HugePages); err != nil {
+			return fail(err)
+		}
+		if s.idxReg, err = newRegion(lay.idxBytes, cfg.Memory.Heap, cfg.Memory.HugePages); err != nil {
+			return fail(err)
+		}
+		if cfg.Memory.Prefault {
+			s.idxReg.prefault(s.idxReg.size)
+		}
+		s.arena = newArena(s.reg.base, s.reg.size)
+		s.idx = newIndex(s.idxReg, s.arena, lay.groups)
+		s.gate = newHeatGate(unsafe.Slice((*heatCell)(unsafe.Add(s.idxReg.base, indexRegionBytes(lay.groups))), cfg.Heat.GateCells))
+		s.policy.a = s.arena
+		if lay.sideSlots > 0 {
+			s.side = make([]V, lay.sideSlots)
+			s.sideFree = make([]uint32, 0, lay.sideSlots)
+		}
+		s.fs.init(cfg.Evict.VictimLimit)
 		s.runFn = func() { c.runMaintenance(s) }
-		if cfg.ObserveHotKeys > 0 {
-			s.hot = newHotTracker(cfg.ObserveHotKeys, hotWindowed, hotAlign, hotInterval)
+		if cfg.Hot.LoadSlots > 0 {
+			if s.hot, err = newHotTracker(cfg.Hot.LoadSlots, cfg.MaxKeyBytes, hotAlign, hotInterval, cfg.Memory.Heap); err != nil {
+				return fail(err)
+			}
 		}
-		if cfg.ObserveRequestKeys > 0 {
-			s.req = newReqTracker(cfg.ObserveRequestKeys, cfg.MaxKeyBytes, hotAlign, hotInterval)
+		if cfg.Hot.RequestSlots > 0 {
+			if s.req, err = newReqTracker(cfg.Hot.RequestSlots, cfg.MaxKeyBytes, hotAlign, hotInterval, cfg.Memory.Heap); err != nil {
+				return fail(err)
+			}
 		}
-		s.countQuota.Store(perCount)
-		s.byteQuota.Store(perBytes)
-		s.countMax = countMax
-		s.fillTokens = math.Max(1, cfg.FillRatePerSec)
-		s.fillByteTokens = math.Max(float64(cfg.MaxEntryBytes), cfg.FillBytesPerSec)
-		s.lastRefill = now
-		for j := range s.stripes {
-			s.stripes[j] = newSampleStripe(cfg.SampleBufferSize)
-		}
-		s.flightStripes = make([]flightStripe[V], cfg.FlightStripes)
+		s.countQuota.Store(perCount + b2i(int64(i) < remCount))
+		s.byteQuota.Store(perBytes + b2i(int64(i) < remBytes))
+		s.sweepAt = now
+		s.flightStripes = make([]flightStripe[V], cfg.Limits.FlightStripes)
 		for j := range s.flightStripes {
-			s.flightStripes[j].init(cfg.FlightsPerStripe, c)
+			s.flightStripes[j].init(cfg.Limits.FlightsPerStripe, c)
 		}
 		c.shards[i] = s
 	}
@@ -438,35 +423,15 @@ func New[V any](cfg Config, opts ...Option[V]) (*Cache[V], error) {
 	}
 	for name, ncfg := range cfg.Namespaces {
 		if _, err := c.registerNamespace(name, ncfg); err != nil {
-			return nil, err
+			return nil, err // validate 已拦下全部失败条件；此处不可达，故不需要归还内存区
 		}
 	}
 	c.cfg.Namespaces = nil // retain only the initialized configuration copies
-	if !cfg.DisableTicker {
+	if !cfg.Runtime.DisableTicker {
 		c.tickerWG.Add(1)
 		go c.tickerLoop()
 	}
 	return &Cache[V]{c: c}, nil
-}
-
-func defaultHeatCap(cfg Config) uint32 {
-	maxTin := 3.0
-	for _, ns := range cfg.Namespaces {
-		if ns.Tin > maxTin {
-			maxTin = ns.Tin
-		}
-	}
-	if !allFiniteNonNegative(maxTin) || maxTin >= float64(heatCountMax) {
-		return heatCountMax
-	}
-	hcap := uint32(math.Ceil(maxTin * 4))
-	if hcap < 4 {
-		hcap = 4
-	}
-	if hcap > heatCountMax {
-		hcap = heatCountMax
-	}
-	return hcap
 }
 
 func (c *cache[V]) registerNamespace(name string, ncfg NamespaceConfig) (*namespace[V], error) {
@@ -494,35 +459,13 @@ func (c *cache[V]) registerNamespace(name string, ncfg NamespaceConfig) (*namesp
 	if _, dup := c.nsByName[name]; dup {
 		return nil, ErrNamespaceExists
 	}
-	if len(cur) >= c.cfg.MaxNamespaces {
+	if len(cur) >= c.cfg.Limits.MaxNamespaces {
 		return nil, ErrOverloaded
-	}
-	now := c.now()
-	if c.state.Load() != cacheOpen {
-		return nil, ErrClosed
 	}
 	name = strings.Clone(name)
 	ns := &namespace[V]{id: uint32(len(cur)), name: name, c: c, cfg: ncfg}
 	ns.gen.Store(1)
-	ns.model.Store(&modelHolder{m: ncfg.Model, since: now})
-	ns.cfg.Model = nil
-	if ncfg.SampleP < 1 {
-		ns.sampleThreshold = uint64(math.Ldexp(ncfg.SampleP, 64))
-		ns.sampleInvP = math.Ldexp(1, 64) / float64(ns.sampleThreshold)
-	} else {
-		ns.sampleInvP = 1
-		ns.sampleAll = true
-	}
 	ns.reqThreshold = c.reqThreshold
-	ns.drawThreshold = max(ns.sampleThreshold, ns.reqThreshold)
-	if ncfg.Prior != nil {
-		prior := *ncfg.Prior
-		if prior.BuiltAt == 0 {
-			prior.BuiltAt = now
-		}
-		ns.prior.Store(&prior)
-	}
-	ns.cfg.Prior = nil
 	c.nsByName[name] = ns
 	// 发布新快照（写锁内；快照只追加，旧快照读者不受影响）。
 	next := make([]*namespace[V], len(cur)+1)
@@ -574,62 +517,8 @@ type Namespace[V any] struct {
 	ns *namespace[V]
 }
 
-// SetModel 原子发布新版本成本模型（旧快照由 GC 回收）。
-func (n *Namespace[V]) SetModel(m CostModel) error {
-	if n == nil || n.ns == nil {
-		return ErrUninitialized
-	}
-	c := n.ns.c
-	c.admissions.Add(1)
-	defer func() { c.admissions.Add(-1); c.checkReclaimed() }()
-	if c.state.Load() != cacheOpen {
-		return ErrClosed
-	}
-	if err := validateModel(m, c.cfg.MaxModelBytes); err != nil {
-		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
-	}
-	if m == nil {
-		m = hitCountModel{version: 1}
-	}
-	now := c.now()
-	if c.state.Load() != cacheOpen {
-		return ErrClosed
-	}
-	n.ns.model.Store(&modelHolder{m: m, since: now})
-	return nil
-}
-
-// SetPrior publishes a copied, finite calibration prior. Nil disables fallback.
-func (n *Namespace[V]) SetPrior(prior *Prior) error {
-	if n == nil || n.ns == nil {
-		return ErrUninitialized
-	}
-	c := n.ns.c
-	c.admissions.Add(1)
-	defer func() { c.admissions.Add(-1); c.checkReclaimed() }()
-	if c.state.Load() != cacheOpen {
-		return ErrClosed
-	}
-	if prior == nil {
-		n.ns.prior.Store(nil)
-		return nil
-	}
-	if !allFiniteNonNegative(prior.Lambda) || prior.BuiltAt < 0 {
-		return fmt.Errorf("%w: invalid prior", ErrInvalidConfig)
-	}
-	copy := *prior
-	if copy.BuiltAt == 0 {
-		copy.BuiltAt = c.now()
-	}
-	if c.state.Load() != cacheOpen {
-		return ErrClosed
-	}
-	n.ns.prior.Store(&copy)
-	return nil
-}
-
 func (c *cache[V]) now() int64 {
-	now := c.cfg.Clock.Now()
+	now := c.cfg.Runtime.Clock.Now()
 	if now < 0 || now >= c.timeLimit {
 		c.stopAdmission()
 		return c.timeLimit // safe for all configured deadline additions
@@ -638,16 +527,16 @@ func (c *cache[V]) now() int64 {
 }
 
 func maxCacheTime(cfg Config) int64 {
-	margin := int64(cfg.MaxTTL)
-	for _, d := range []int64{int64(cfg.Grace), int64(cfg.ColdFor), int64(cfg.LoadTimeout), int64(cfg.HandoffTimeout),
-		int64(cfg.PriorMaxAge), int64(cfg.ModelMaxAge), int64(cfg.PeriodicInterval), int64(cfg.RoundSoftTimeBudget), int64(cfg.WheelTick),
-		2 * int64(cfg.ValueDelta), 2 * int64(cfg.HeatDelta)} {
+	margin := int64(maxTTL)
+	for _, d := range []int64{int64(cfg.Limits.LoadTimeout), int64(cfg.Limits.HandoffTimeout),
+		int64(cfg.Runtime.PeriodicInterval), int64(cfg.Runtime.RoundSoftTimeBudget), int64(cfg.Runtime.SweepPeriod),
+		2 * int64(cfg.Heat.Delta), int64(cfg.Evict.Horizon)} {
 		if d > margin {
 			margin = d
 		}
 	}
 	limit := int64(math.MaxInt64) - margin
-	if heatLimit, ok := checkedProduct(int64(1<<heatEpochBits-1), int64(cfg.HeatDelta)); ok && heatLimit < limit {
+	if heatLimit, ok := checkedProduct(int64(1<<heatEpochBits-1), int64(cfg.Heat.Delta)); ok && heatLimit < limit {
 		limit = heatLimit
 	}
 	return limit
@@ -686,14 +575,9 @@ func (c *cache[V]) shardOf(keyHash uint64) *shard[V] {
 	return c.shards[keyHash&(uint64(len(c.shards))-1)]
 }
 
-// shardPoolSize 计算分片条目池容量（D4：覆盖池槽的全部合法需求）。
-// 任一时刻存活的池槽占用 = 驻留（≤countMax）+ 未发布候选（≤FillQueueSize，
-// 外加少量泵内瞬态）+ 退休未结算记录（全局 RetiredRecords 全部计入：退休记录
-// 可能全部集中在同一分片，因此不按 ShardCount 切分）+ 本分片 flight 槽
-// （FlightStripes×FlightsPerStripe）。超出极端瞬态仍可优雅拒绝（ALLOCATION_FAILED）。
-func shardPoolSize(cfg Config, countMax int64) int {
-	if cfg.ObserveOnly {
-		return 0 // 填充在申请池槽前被拒绝，不预留驻留存储。
+func b2i(b bool) int64 {
+	if b {
+		return 1
 	}
-	return int(countMax) + cfg.FillQueueSize + cfg.RetiredRecords + cfg.FlightStripes*cfg.FlightsPerStripe
+	return 0
 }

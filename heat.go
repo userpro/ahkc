@@ -1,6 +1,10 @@
 package ahkc
 
-import "sync/atomic"
+import (
+	"math/bits"
+	"sync/atomic"
+	"unsafe"
+)
 
 // 双时间桶热度。
 //
@@ -101,43 +105,58 @@ func (c *heatCell) read(e uint64, phi float64) (float64, bool) {
 	return float64(s.cur) + (1-phi)*float64(s.prev), true
 }
 
-// heatGate 是非驻留门卫：固定 rows x width 单元，完整 key 映射至各行。
-// 查询取各行 H 的最小值。碰撞可高估，饱和与更新竞争也可低估；
+// heatRetries 是热度更新 CAS 的最大尝试次数：失败即放弃本次更新（有损，宁可低估也不自旋）。
+const heatRetries = 2
+
+// gateLine 是门卫一组的热度单元数：64 字节 = 一条缓存行。
+const gateLine = 8
+
+// heatGate 是非驻留门卫：每个 key 映射到一组（一条缓存行，8 个热度单元），
+// 4 行各在组内自己的 16 字节段（2 个单元）中二选一；查询取 4 个单元热度的最小值。
+// 一次 miss 的读与写都只访问一条缓存行。碰撞可高估，饱和与更新竞争也可低估；
 // 这是准入门卫，不能套用未饱和 Count-Min 的频率误差保证。
+//
+// shortcut: 默认单元数按容量近似（见 applyDefaults 中的 Heat.GateCells）；规模场景应按"每个 Heat.Delta 内
+// 去重后的未命中 key 数的 4 倍"设置 Heat.GateCells。
 type heatGate struct {
-	rows  int
-	width int
-	cells []heatCell // rows*width，行优先
+	cells  []heatCell // groups × gateLine
+	groups uint64
 }
 
-func newHeatGate(rows, width int) heatGate {
-	return heatGate{rows: rows, width: width, cells: make([]heatCell, rows*width)}
+// newHeatGate 把门卫建立在 cells 上（长度须是 gateLine 的正整数倍，且已清零）。
+func newHeatGate(cells []heatCell) heatGate {
+	return heatGate{cells: cells, groups: uint64(len(cells) / gateLine)}
+}
+
+func gateRegionBytes(cells int) uintptr { return uintptr(cells) * unsafe.Sizeof(heatCell{}) }
+
+func (g *heatGate) line(keyHash uint64) (*[gateLine]heatCell, uint64) {
+	h := mix64(keyHash ^ rowSeedStep)
+	hi, _ := bits.Mul64(h, g.groups)
+	return (*[gateLine]heatCell)(g.cells[hi*gateLine:]), h
 }
 
 const rowSeedStep = 0x9e3779b97f4a7c15
 
-func (g *heatGate) cellAt(row int, keyHash uint64) *heatCell {
-	h := mix64(keyHash + uint64(row)*rowSeedStep)
-	return &g.cells[row*g.width+int(h%uint64(g.width))]
-}
-
 // add 仅 miss 路径调用：各行独立有限次尝试。
-func (g *heatGate) add(keyHash, e uint64, hcap uint32, retries int) {
-	for row := 0; row < g.rows; row++ {
-		g.cellAt(row, keyHash).add(e, hcap, retries)
+func (g *heatGate) add(keyHash, e uint64) {
+	line, h := g.line(keyHash)
+	for row := uint(0); row < 4; row++ {
+		line[row*2+uint(h>>row)&1].add(e, heatCountMax, heatRetries)
 	}
 }
 
 // read 返回各行热度的最小值；任一 UNKNOWN 则整体 UNKNOWN。
 func (g *heatGate) read(keyHash, e uint64, phi float64) (float64, bool) {
+	line, h := g.line(keyHash)
 	lowest := float64(0)
-	for row := 0; row < g.rows; row++ {
-		h, ok := g.cellAt(row, keyHash).read(e, phi)
+	for row := uint(0); row < 4; row++ {
+		v, ok := line[row*2+uint(h>>row)&1].read(e, phi)
 		if !ok {
 			return 0, false
 		}
-		if row == 0 || h < lowest {
-			lowest = h
+		if row == 0 || v < lowest {
+			lowest = v
 		}
 	}
 	return lowest, true

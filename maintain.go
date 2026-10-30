@@ -14,18 +14,15 @@ const (
 	ownerIdle int32 = iota
 	ownerQueued
 	ownerRunning
+	ownerDead // 内存区已释放：永远不再接受维护任务
 )
 
-const (
-	pauseWheelRebase      int32 = 1
-	pauseExecutorRejected int32 = 2
-)
+const pauseExecutorRejected int32 = 2
 
 // 维护类别。
 const (
 	classControl = iota
 	classLifecycle
-	classSamples
 	classFill
 	classReclaim
 	classCount
@@ -47,10 +44,6 @@ func (c *cache[V]) ensureMaintenanceTask(s *shard[V]) {
 	if !s.ownerState.CompareAndSwap(ownerIdle, ownerQueued) {
 		return // 正在 QUEUED/RUNNING：只记录待处理工作
 	}
-	if c.state.Load() == cacheReclaimed {
-		s.ownerState.Store(ownerIdle)
-		return
-	}
 	if !c.trySubmit(s.runFn) {
 		s.ownerState.Store(ownerIdle)
 		s.pauseReasons.Or(pauseExecutorRejected)
@@ -67,15 +60,10 @@ func (c *cache[V]) runMaintenance(s *shard[V]) {
 	}
 	s.pauseReasons.And(^pauseExecutorRejected)
 	s.pending.Store(false)
-	// 填充速率令牌补充：账目字段仅维护者修改（owner 上下文）。
-	c.refillFillTokens(s)
-	quota := c.cfg.RoundWorkLimit
-	deadline := c.now() + int64(c.cfg.RoundSoftTimeBudget)
+	quota := c.cfg.Runtime.RoundWorkLimit
+	deadline := c.now() + int64(c.cfg.Runtime.RoundSoftTimeBudget)
 	s.roundActive = true
 	s.roundDeadline = deadline
-	s.retireWorkLeft = int64(c.cfg.RetireLimitPerRound)
-	s.retireBytesLeft = c.cfg.RetireBytesPerRound
-	s.reclaimBytesLeft = c.cfg.ReclaimBytesPerRound
 	softExpired := func() bool { return c.now() >= deadline }
 	perClass := quota / classCount
 	if perClass < 1 {
@@ -96,7 +84,7 @@ func (c *cache[V]) runMaintenance(s *shard[V]) {
 	// 配额 / 软预算用尽且仍有可立即推进的工作时直接续行（A.9：完成配额后有待续工作则安排下一轮）；
 	// 只剩等待时间 / 读者的工作才按周期节流，避免输入信号把空转的维护者反复唤醒。
 	if (work >= quota || softExpired()) && !immediate {
-		s.nextAllowedRun.Store(c.now() + int64(c.cfg.PeriodicInterval))
+		s.nextAllowedRun.Store(c.now() + int64(c.cfg.Runtime.PeriodicInterval))
 	}
 	s.ownerState.Store(ownerIdle)
 	// 退出至 IDLE 后重查输入，覆盖 enqueue 与退出交叉（A.9）：
@@ -109,19 +97,7 @@ func (c *cache[V]) runMaintenance(s *shard[V]) {
 }
 
 func (c *cache[V]) immediateWorkRemains(s *shard[V]) bool {
-	fillReady := len(s.fillQueue) > 0 && s.fillTokens >= 1 && s.fillByteTokens >= float64(c.cfg.MaxEntryBytes)
-	if head := s.fillHead.Load(); head != nil {
-		fillReady = s.fillTokens >= 1 && s.fillByteTokens >= float64(head.e.billedBytes)
-	}
-	if fillReady || len(s.controlQueue) > 0 || len(s.creditQueue) > 0 || s.deferredControl.Load() != nil || s.wheel.rebasing {
-		return true
-	}
-	for _, st := range s.stripes {
-		if st.queued.Load() != 0 || st.faultFlag.Load() {
-			return true
-		}
-	}
-	return false
+	return len(s.fillQueue) > 0 || len(s.controlQueue) > 0 || s.reclaimMore
 }
 
 // stepClass 执行一个类别的有界工作，返回完成的工作单元数。
@@ -131,8 +107,6 @@ func (c *cache[V]) stepClass(s *shard[V], cls, allowance int) int {
 		return c.controlStep(s, allowance)
 	case classLifecycle:
 		return c.lifecycleStep(s, allowance)
-	case classSamples:
-		return c.drainSamples(s, allowance)
 	case classFill:
 		return c.fillStep(s, allowance)
 	case classReclaim:
@@ -141,39 +115,14 @@ func (c *cache[V]) stepClass(s *shard[V], cls, allowance int) int {
 	return 0
 }
 
-// controlStep 处理控制操作：先服务失效确认，再服务额度转移。
-// 两类操作使用独立队列：额度转移取不到全局 creditOwner 时只暂存自己，
-// 不会让排在后面的失效确认等待一个周期（避免队头阻塞）。
+// controlStep 处理控制操作（单 key 失效确认）。
 func (c *cache[V]) controlStep(s *shard[V], allowance int) int {
 	n := 0
 	for n < allowance {
 		select {
 		case op := <-s.controlQueue:
 			n++
-			c.processControl(s, op) // 失效操作不会因竞争失败
-			continue
-		default:
-		}
-		break
-	}
-	for n < allowance {
-		if op := s.deferredControl.Load(); op != nil {
-			n++
-			if !c.processControl(s, op) {
-				s.nextAllowedRun.Store(c.now() + int64(c.cfg.PeriodicInterval))
-				return n
-			}
-			s.deferredControl.Store(nil)
-			continue
-		}
-		select {
-		case op := <-s.creditQueue:
-			n++
-			if !c.processControl(s, op) {
-				s.deferredControl.Store(op)
-				s.nextAllowedRun.Store(c.now() + int64(c.cfg.PeriodicInterval))
-				return n
-			}
+			c.processControl(s, op)
 		default:
 			return n
 		}
@@ -181,195 +130,126 @@ func (c *cache[V]) controlStep(s *shard[V], allowance int) int {
 	return n
 }
 
-// lifecycleStep 关闭扫描 + 时间轮推进 + 固定槽冷却扫描。
+// lifecycleStep 终结关闭时排队的候选、消费过期提示，并推进唯一的慢扫描游标。
 func (c *cache[V]) lifecycleStep(s *shard[V], allowance int) int {
-	now := c.now()
-	if s.wheel.exhausted || s.epoch.epoch.Load() >= math.MaxUint64-2 {
+	if s.epoch.epoch.Load() >= math.MaxUint64-2 {
 		c.stopAdmission()
 	}
 	work := 0
-	if s.closeRequested.Load() {
-		work += c.closeSweepStep(s, allowance)
-		if work >= allowance {
-			return work
+	closing := s.closeRequested.Load()
+	if closing {
+		work += c.cancelQueuedFills(s, allowance)
+	}
+	work += c.consumeHints(s)
+	// 额外扫描量不计入类别配额，避免挤占其他维护类别。
+	return min(work+c.sweepStep(s, max(allowance-work, 0), closing), allowance)
+}
+
+// retireStale 在条目不可读、代际失效或过期时退休它；仍有效则不动。
+func (c *cache[V]) retireStale(s *shard[V], e *entry, now int64) {
+	if !e.isReadable() || !e.genIs(c.nsByID(e.nsID).gen.Load()) || now >= e.hardDeadline {
+		e.setReadable(false)
+		c.tryRetire(s, e) // 无退休额度时仍留在索引，下次扫描重试
+	}
+}
+
+// consumeHints 取出读者登记的失效提示并按语义复核后退休（提示只存索引槽号，
+// 槽内当前条目是否失效以复核为准，因此条目被复用也不会误删）。
+func (c *cache[V]) consumeHints(s *shard[V]) int {
+	work := 0
+	for i := range s.hints {
+		if s.hints[i].Load() == 0 {
+			continue
+		}
+		h := s.hints[i].Swap(0)
+		if h == 0 {
+			continue
+		}
+		work++
+		c.metrics.expiredHints.Add(1)
+		if e := s.idx.slotEntry(int(h - 1)); e != nil {
+			c.retireStale(s, e, c.now())
 		}
 	}
-	valid := func(e *entry[V], now int64) bool {
-		return e.readable.Load() && e.nsGen == c.nsByID(e.nsID).gen.Load() && now < e.hardDeadline
-	}
-	retire := func(e *entry[V]) bool { return c.tryRetire(s, e) }
-	// Independent shares keep wheel catch-up from starving the cold cursor.
-	left := allowance - work
-	coldQuota := (left + 1) / 2
-	wheelQuota := left - coldQuota
-	if s.wheel.rebasing {
-		if s.wheel.rebaseStep(s.idx, wheelQuota, now, valid, retire) {
-			s.pauseReasons.And(^pauseWheelRebase)
-		}
-		work += wheelQuota
-	} else {
-		r := s.wheel.advance(now, wheelQuota, c.cfg.MaxWheelLag, valid, retire)
-		if r < 0 {
-			s.wheel.startRebase(now / int64(c.cfg.WheelTick))
-			s.pauseReasons.Or(pauseWheelRebase)
-		} else {
-			work += r
-		}
-	}
-	work += c.coldSweep(s, coldQuota)
 	return work
 }
 
-// coldSweep 固定索引槽冷却扫描（COLD_SWEEP）。
-func (c *cache[V]) coldSweep(s *shard[V], quota int) int {
-	work := 0
-	delta := int64(c.cfg.HeatDelta)
-	for i := 0; i < quota; i++ {
-		work++ // Empty slots are real scan work too.
-		slot := s.coldCursor
-		s.coldCursor = (s.coldCursor + 1) % s.idx.slotCount
-		e := s.idx.slotEntry(slot)
+// sweepStep 是唯一的慢扫描游标：处理过期、命名空间代际失效与关闭。
+// 非关闭时扫描量严格按流逝时间折算，使整张索引约在 SweepPeriod 内扫完一遍：维护被填充等事件
+// 频繁唤醒时不会多扫（allowance 只决定超出配额后是否检查软预算，不是扫描下限）；
+// 折算不足一个槽的时间留在 sweepAt 里继续累计，不会丢。关闭时不受周期限制。
+// 超出 allowance 的部分只在软时间预算内继续，每 256 槽检查一次。
+//
+// shortcut: 软预算耗尽时放弃本轮欠下的扫描量而不累计，覆盖周期在高负载下会变长；
+// 需要严格覆盖保证时改为累计欠账。
+func (c *cache[V]) sweepStep(s *shard[V], allowance int, closing bool) int {
+	now := c.now()
+	n := len(s.idx.words)
+	scan := n
+	if !closing {
+		period := int64(c.cfg.Runtime.SweepPeriod)
+		elapsed := min(now-s.sweepAt, period)
+		scan = min(int(float64(elapsed)/float64(period)*float64(n)), n)
+		if scan == 0 {
+			return 0 // 欠账不足一个槽：不推进 sweepAt，让时间继续累计
+		}
+		// 只前进已折算的那部分时间，余数留给下一轮
+		s.sweepAt += int64(float64(scan) / float64(n) * float64(period))
+		if scan == n {
+			s.sweepAt = now
+		}
+	} else {
+		s.sweepAt = now
+	}
+	done := 0
+	for done < scan {
+		if done >= allowance && done&255 == 0 && s.roundActive && c.now() >= s.roundDeadline {
+			break
+		}
+		e := s.idx.slotEntry(s.sweepCursor)
+		if s.sweepCursor++; s.sweepCursor == n {
+			s.sweepCursor = 0
+		}
+		done++
 		if e == nil {
 			continue
 		}
-		t := c.now()
-		ns := c.nsByID(e.nsID)
-		switch {
-		case !e.readable.Load() || e.nsGen != ns.gen.Load() || t >= e.hardDeadline:
-			e.readable.Store(false)
-			c.tryRetire(s, e) // 无预算仍留索引计量
-		case t < e.graceUntil:
-			// 宽限期内跳过
-		default:
-			h, ok := e.heat.read(bucketIndex(t, delta), bucketPhi(t, delta))
-			if !ok {
-				e.lowSince = 0
-				continue
-			}
-			if h >= ns.cfg.Tout {
-				e.lowSince = 0
-				continue
-			}
-			if e.lowSince == 0 {
-				e.lowSince = t
-				continue
-			}
-			if t-e.lowSince >= int64(c.cfg.ColdFor) {
-				t2 := c.now()
-				h2, ok := e.heat.read(bucketIndex(t2, delta), bucketPhi(t2, delta))
-				if !ok {
-					e.lowSince = 0
-					continue
-				}
-				if h2 < ns.cfg.Tout {
-					e.readable.Store(false)
-					c.tryRetire(s, e)
-				} else {
-					e.lowSince = 0
-				}
-			}
+		if closing {
+			e.setReadable(false)
+			c.tryRetire(s, e) // 退休额度不足者留待下一圈
+		} else {
+			c.retireStale(s, e, now)
 		}
 	}
-	return work
+	return done
 }
 
-// drainSamples 汇总收益样本（DRAIN_SAMPLES）。
-// 轮转经过全部条带：只有连续 len(stripes) 个条带都为空时才结束
-// （TRY_POP_NEXT_SAMPLE_ROUND_ROBIN 语义），单个空条带不中断本轮。
-func (c *cache[V]) drainSamples(s *shard[V], quota int) int {
-	now := c.now()
-	work := 0
-	delta := int64(c.cfg.ValueDelta)
-	emptyStreak := 0
-	for work < quota {
-		st := s.stripes[s.stripeDrain%len(s.stripes)]
-		s.stripeDrain = (s.stripeDrain + 1) % len(s.stripes)
-		work++ // empty/busy stripes and quality flags consume scan work too
-		if st.faultFlag.Swap(false) {
-			s.stats.lastFaultAt = now
-			c.metrics.samplesDropped.Add(1)
-		}
-		sm, ok := st.pop()
-		if !ok {
-			emptyStreak++
-			if emptyStreak >= len(s.stripes) {
-				break // 本轮所有条带均已清空
-			}
-			continue
-		}
-		emptyStreak = 0
-		// A sample can arrive after the class-start timestamp. Compare it to
-		// current time after popping, retaining the same event-time bucket.
-		now = c.now()
-		ns := c.nsByID(sm.nsID)
-		if sm.nsGen != ns.gen.Load() {
-			continue // 代际不符：丢弃
-		}
-		if now-sm.eventTime > int64(c.cfg.MaxSampleLag) {
-			s.stats.lastLagViolation = now
-		}
-		s.stats.addSample(sm, now, delta)
-	}
-	return work
-}
-
-// fillStep 处理填充候选（受填充速率令牌与暂停标记约束）。
+// fillStep 处理填充候选；每轮工作量由类别配额与软时间预算限制。
 func (c *cache[V]) fillStep(s *shard[V], allowance int) int {
 	work := 0
 	for work < allowance {
 		if work > 0 && s.roundActive && c.now() >= s.roundDeadline {
 			return work
 		}
-		a := s.fillHead.Load()
-		if a == nil {
-			if c.state.Load() == cacheOpen && s.pauseReasons.Load()&pauseWheelRebase == 0 && s.fillTokens < 1 {
-				return work
-			}
-			select {
-			case a = <-s.fillQueue:
-				s.fillHead.Store(a)
-			default:
-				return work
-			}
-		}
-		if c.state.Load() != cacheOpen {
-			s.fillHead.Store(nil)
-			c.rejectCandidate(a, fillRejectedClosed)
-			work++
-			continue
-		}
-		if s.pauseReasons.Load()&pauseWheelRebase != 0 {
-			s.fillHead.Store(nil)
-			c.rejectCandidate(a, fillRejectedResourceLimit)
-			work++
-			continue
-		}
-		if s.fillTokens < 1 || s.fillByteTokens < float64(a.e.billedBytes) {
+		var a *fillCandidate[V]
+		select {
+		case a = <-s.fillQueue:
+		default:
 			return work
 		}
-		// 额度不足且有积压：向协调者申请空闲额度（不驱逐其他分片热点）。
-		// 条数已触及索引物理上限时额外条数额度无法使用，只有字节缺口才值得申请，避免字节额度囤积。
-		countShort := s.residentCount.Load() >= s.countQuota.Load() && s.countQuota.Load() < s.countMax
-		byteShort := s.residentBytes.Load()+a.e.billedBytes > s.byteQuota.Load()
-		if countShort || byteShort {
-			s.wantCredit.Store(true)
+		if c.state.Load() != cacheOpen {
+			c.rejectCandidate(a, fillRejectedClosed)
+		} else {
+			c.processFill(s, a)
 		}
-		s.fillHead.Store(nil)
-		s.fillTokens--
-		s.fillByteTokens -= float64(a.e.billedBytes)
-		c.processFill(s, a)
 		work++
 	}
 	return work
 }
 
-// closeSweepStep 关闭时按配额摘除全部驻留条目并取消排队候选。
-func (c *cache[V]) closeSweepStep(s *shard[V], allowance int) int {
+// cancelQueuedFills 关闭时终结排队与队首候选。
+func (c *cache[V]) cancelQueuedFills(s *shard[V], allowance int) int {
 	work := 0
-	if a := s.fillHead.Swap(nil); a != nil {
-		c.rejectCandidate(a, fillRejectedClosed)
-		work++
-	}
 	for work < (allowance+1)/2 {
 		select {
 		case a := <-s.fillQueue:
@@ -377,36 +257,16 @@ func (c *cache[V]) closeSweepStep(s *shard[V], allowance int) int {
 			c.disposeCandidate(a)
 			work++
 		default:
-			goto scan
+			return work
 		}
-	}
-scan:
-	for work < allowance && s.closeCursor < s.idx.slotCount {
-		e := s.idx.slotEntry(s.closeCursor)
-		s.closeCursor++
-		work++
-		if e == nil {
-			continue
-		}
-		e.readable.Store(false)
-		c.tryRetire(s, e) // 退休预算不足留待下轮（coldSweep 覆盖不可读条目）
-	}
-	if s.closeCursor >= s.idx.slotCount {
-		s.closeCursor = 0 // 预算不足者下轮重扫
 	}
 	return work
 }
 
 // processControl 处理控制操作。
-func (c *cache[V]) processControl(s *shard[V], op *controlOp[V]) bool {
-	if op.kind == ctlCreditTake || op.kind == ctlCreditApply {
-		if !c.creditOwner.CompareAndSwap(false, true) {
-			return false
-		}
-		defer c.creditOwner.Store(false)
-	}
+func (c *cache[V]) processControl(s *shard[V], op *controlOp[V]) {
 	if !op.claimed.CompareAndSwap(false, true) {
-		return true
+		return
 	}
 	defer op.release()
 	switch op.kind {
@@ -416,60 +276,23 @@ func (c *cache[V]) processControl(s *shard[V], op *controlOp[V]) bool {
 		if _, ok := checkedNext(&s.fillFence); !ok {
 			c.stopAdmission()
 			op.result.finish(ErrExhausted)
-			return true
+			return
 		}
 		fr := s.idx.find(op.key, op.keyHash, op.ns.id)
 		if fr.found {
-			fr.e.readable.Store(false)
+			fr.e.setReadable(false)
 			c.tryRetire(s, fr.e)
 		}
 		c.metrics.keyInvalidations.Add(1)
 		op.result.finish(nil)
-	case ctlCreditTake:
-		// DONOR_TAKE_IDLE_IN_OWNER：只捐出空闲额度。
-		keepN := s.countQuota.Load() / 8
-		keepB := s.byteQuota.Load() / 8
-		freeN := s.countQuota.Load() - s.residentCount.Load() - keepN
-		freeB := s.byteQuota.Load() - s.residentBytes.Load() - keepB
-		if freeN < 0 {
-			freeN = 0
-		}
-		if freeB < 0 {
-			freeB = 0
-		}
-		takeN := min(op.amountN, freeN)
-		takeB := min(op.amountB, freeB)
-		if takeN > 0 || takeB > 0 {
-			s.countQuota.Add(-takeN)
-			s.byteQuota.Add(-takeB)
-			c.globalFreeCount.Add(takeN)
-			c.globalFreeBytes.Add(takeB)
-			c.metrics.creditMoved.Add(1)
-		}
-		op.result.finish(nil)
-	case ctlCreditApply:
-		// RECEIVER_APPLY_IN_OWNER：不超物理上限。
-		if s.countQuota.Load()+op.amountN <= s.countMax {
-			s.countQuota.Add(op.amountN)
-			s.byteQuota.Add(op.amountB)
-			c.metrics.creditMoved.Add(1)
-		} else {
-			c.globalFreeCount.Add(op.amountN)
-			c.globalFreeBytes.Add(op.amountB)
-		}
-		s.creditPendingN -= op.amountN
-		c.creditInTransitN.Add(-op.amountN)
-		c.creditInTransitB.Add(-op.amountB)
-		op.result.finish(nil)
 	}
-	return true
 }
 
 // ---- 定时触发与全局维护面（PERIODIC_TICK）----
 
 func (c *cache[V]) tickerLoop() {
 	defer c.tickerWG.Done()
-	t := time.NewTicker(c.cfg.PeriodicInterval)
+	t := time.NewTicker(c.cfg.Runtime.PeriodicInterval)
 	defer t.Stop()
 	for {
 		select {
@@ -479,23 +302,6 @@ func (c *cache[V]) tickerLoop() {
 			c.periodicTick()
 		}
 	}
-}
-
-// refillFillTokens 补充填充速率令牌（仅维护者调用）。
-func (c *cache[V]) refillFillTokens(s *shard[V]) {
-	now := c.now()
-	// 时钟回拨（ManualClock.Set 或宿主时钟校正）时 now < lastRefill：负时长不得倒扣令牌，
-	// 否则令牌被扣成大负数，填充停滞约回拨时长。lastRefill 仍跟随时钟，之后照常补充。
-	elapsed := float64(max(now-s.lastRefill, 0)) / 1e9
-	s.fillTokens += elapsed * c.cfg.FillRatePerSec
-	if cap := math.Max(1, c.cfg.FillRatePerSec); s.fillTokens > cap {
-		s.fillTokens = cap
-	}
-	s.fillByteTokens += elapsed * c.cfg.FillBytesPerSec
-	if cap := math.Max(float64(c.cfg.MaxEntryBytes), c.cfg.FillBytesPerSec); s.fillByteTokens > cap {
-		s.fillByteTokens = cap
-	}
-	s.lastRefill = now
 }
 
 func (c *cache[V]) periodicTick() {
@@ -510,21 +316,20 @@ func (c *cache[V]) periodicTick() {
 		return
 	}
 	c.rollHotWindow()
-	quota := (c.cfg.PeriodicWorkLimit - 2*min(32, c.cfg.RoundWorkLimit/classCount)) / 33
+	quota := (c.cfg.Runtime.PeriodicWorkLimit - 2*min(32, c.cfg.Runtime.RoundWorkLimit/classCount)) / 33
 	if quota > len(c.shards) {
 		quota = len(c.shards)
 	}
 	for work := 0; work < quota; work++ {
 		s := c.shards[c.periodicCursor]
 		c.periodicCursor = (c.periodicCursor + 1) % len(c.shards)
-		// 定时触发不依赖新请求：负责空闲时的 TTL/冷却/Flight 期限与回收进展。
+		// 定时触发不依赖新请求：负责空闲时的慢扫描、Flight 期限与回收进展。
 		s.nextAllowedRun.Store(0) // an explicit periodic visit permits one bounded round
 		c.signalMaintenance(s)
 		c.expireWaitersStep(s, 32)
 	}
 	c.drainNsControls()
 	c.ensureNsDrain() // 覆盖 drain 期间新入队的命名空间控制
-	c.creditCoordinator()
 	c.checkReclaimed()
 }
 
@@ -542,7 +347,7 @@ func (c *cache[V]) drainNsControls() {
 		return
 	}
 	defer c.nsCtlOwner.Store(false)
-	for work := 0; work < min(32, c.cfg.RoundWorkLimit/classCount); work++ {
+	for work := 0; work < min(32, c.cfg.Runtime.RoundWorkLimit/classCount); work++ {
 		select {
 		case op := <-c.nsControlQueue:
 			ns := op.ns
@@ -581,92 +386,6 @@ func (c *cache[V]) ensureNsDrain() {
 	}
 }
 
-// creditCoordinator 空闲额度转移（A.9）：收票 → 捐出 → 授予。
-// 不驱逐其他分片热点来满足填充；请求不等待跨分片调配。
-func (c *cache[V]) creditCoordinator() {
-	if c.state.Load() != cacheOpen {
-		return
-	}
-	if !c.creditOwner.CompareAndSwap(false, true) {
-		return
-	}
-	defer c.creditOwner.Store(false)
-	// Visit a fixed number of receiver/donor records and save both cursors.
-	quota := min(32, int64(c.cfg.RoundWorkLimit/classCount))
-	for work := int64(0); work < quota; work++ {
-		s := c.shards[c.creditCursor%len(c.shards)]
-		c.creditCursor = (c.creditCursor + 1) % len(c.shards)
-		if !s.wantCredit.CompareAndSwap(true, false) {
-			continue
-		}
-		wantN := s.countMax/8 + 1
-		wantB := s.byteQuota.Load()/8 + c.cfg.MaxEntryBytes
-		// 先从全局空闲授予。
-		gn := min(min(wantN, c.globalFreeCount.Load()), s.countMax-s.countQuota.Load()-s.creditPendingN)
-		gb := min(wantB, c.globalFreeBytes.Load())
-		if gn > 0 || gb > 0 {
-			grantID, ok := checkedNext(&c.creditSeq)
-			if !ok {
-				c.stopAdmission()
-				return
-			}
-			c.globalFreeCount.Add(-gn)
-			c.globalFreeBytes.Add(-gb)
-			c.creditInTransitN.Add(gn)
-			c.creditInTransitB.Add(gb)
-			s.creditPendingN += gn
-			if !c.sendControl(s, &controlOp[V]{kind: ctlCreditApply, grantID: grantID, amountN: gn, amountB: gb}) {
-				c.globalFreeCount.Add(gn)
-				c.globalFreeBytes.Add(gb)
-				c.creditInTransitN.Add(-gn)
-				c.creditInTransitB.Add(-gb)
-				s.creditPendingN -= gn
-				s.wantCredit.Store(true)
-			}
-			continue
-		}
-		// 从空闲分片捐出（本轮每申请者至多一个捐出方）。
-		s.wantCredit.Store(true)
-		for donorWork := 0; donorWork < len(c.shards) && work+1 < quota; donorWork++ {
-			work++
-			d := c.shards[c.creditDonorCursor%len(c.shards)]
-			c.creditDonorCursor = (c.creditDonorCursor + 1) % len(c.shards)
-			if d == s {
-				continue
-			}
-			idleN := d.countQuota.Load() - d.residentCount.Load()
-			idleB := d.byteQuota.Load() - d.residentBytes.Load()
-			if idleN <= d.countQuota.Load()/4 || idleB <= d.byteQuota.Load()/4 {
-				continue
-			}
-			grantID, ok := checkedNext(&c.creditSeq)
-			if !ok {
-				c.stopAdmission()
-				return
-			}
-			c.sendControl(d, &controlOp[V]{kind: ctlCreditTake, grantID: grantID, amountN: wantN, amountB: wantB})
-			// 下一轮 tick 再从 globalFree 授予接收方。
-			s.wantCredit.Store(true)
-			break
-		}
-	}
-}
-
-// sendControl 投递分片控制；失败（队列满）则放弃本轮转移。
-func (c *cache[V]) sendControl(s *shard[V], op *controlOp[V]) bool {
-	if c.controlBudget.tryReserveInto(&op.rc, 1) != failOK {
-		return false
-	}
-	select {
-	case s.creditQueue <- op:
-		c.signalMaintenance(s)
-		return true
-	default:
-		op.release()
-		return false
-	}
-}
-
 // pollClose 报告关闭进展的三阶段状态（A.9 POLL_CLOSE）：
 // stopped=已停止受理；workDrained=已受理控制/填充终结且真实 I/O 与响应均结束；
 // reclaimed=无驻留/退休/交接残留且全部预算归还。
@@ -679,11 +398,11 @@ func (c *cache[V]) pollClose() (stopped, workDrained, reclaimed bool) {
 		return false, false, false
 	}
 	stopped = true // 停止受理：state 离开 OPEN 即成立
-	if c.admissions.Load() != 0 || len(c.nsControlQueue) != 0 || c.nsCtlDraining.Load() || c.nsCtlOwner.Load() || c.creditOwner.Load() {
+	if c.admissions.Load() != 0 || len(c.nsControlQueue) != 0 || c.nsCtlDraining.Load() || c.nsCtlOwner.Load() {
 		return stopped, false, false
 	}
 	for _, s := range c.shards {
-		if len(s.fillQueue) != 0 || s.fillHead.Load() != nil || len(s.controlQueue) != 0 || len(s.creditQueue) != 0 || s.deferredControl.Load() != nil || s.flightCount.Load() != 0 {
+		if len(s.fillQueue) != 0 || len(s.controlQueue) != 0 || s.flightCount.Load() != 0 {
 			return stopped, false, false
 		}
 	}
@@ -697,7 +416,7 @@ func (c *cache[V]) pollClose() (stopped, workDrained, reclaimed bool) {
 	if c.controlBudget.available() != c.controlBudget.limit {
 		return stopped, false, false
 	}
-	if c.creditInTransitN.Load() != 0 || c.creditInTransitB.Load() != 0 || c.hotCallbackPending.Load() {
+	if c.hotCallbackPending.Load() {
 		return stopped, false, false
 	}
 	if c.tasks.Load() != 0 || c.tickOwner.Load() {
@@ -708,13 +427,25 @@ func (c *cache[V]) pollClose() (stopped, workDrained, reclaimed bool) {
 			return stopped, true, false
 		}
 	}
-	if c.retiredBytes.available() != c.retiredBytes.limit || c.retiredRecords.available() != c.retiredRecords.limit {
-		return stopped, true, false
-	}
 	if c.handleBudget.available() != c.handleBudget.limit {
 		return stopped, true, false
 	}
 	return stopped, true, true
+}
+
+// sealShards 把全部分片原子地从 IDLE 置为 DEAD：此后没有维护任务能再启动，释放内存区才安全
+// （pollClose 的检查与释放之间，定时触发可能又排入一轮，它会读到已释放的内存）。
+// 任一分片忙则回滚，留给下一次 checkReclaimed；回滚期间被拒的调度由周期触发补上。
+func (c *cache[V]) sealShards() bool {
+	for i, s := range c.shards {
+		if !s.ownerState.CompareAndSwap(ownerIdle, ownerDead) {
+			for _, p := range c.shards[:i] {
+				p.ownerState.Store(ownerIdle)
+			}
+			return false
+		}
+	}
+	return true
 }
 
 // checkReclaimed 达到 RECLAIMED 时关闭通道（ticker / MaintenanceStep 驱动）。
@@ -726,10 +457,13 @@ func (c *cache[V]) checkReclaimed() {
 	if drained && c.drained.CompareAndSwap(false, true) {
 		close(c.drainedCh)
 	}
-	if !reclaimed {
+	if !reclaimed || !c.sealShards() {
 		return
 	}
 	if c.state.CompareAndSwap(cacheClosing, cacheReclaimed) {
+		for _, s := range c.shards {
+			s.release()
+		}
 		close(c.stopTick)
 		close(c.closedCh)
 	}

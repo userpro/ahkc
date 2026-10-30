@@ -11,7 +11,7 @@ import (
 )
 
 func TestRequestResetFailureInvalidatesOldKey(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1, Prior: testPrior}, nil)
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1}, nil)
 	defer closeManual(t, env.c, env.ex)
 	if _, err := env.fetch("old", okLoader("value")); err != nil {
 		t.Fatal(err)
@@ -50,7 +50,7 @@ func TestSettledHandlesReleaseCache(t *testing.T) {
 			done := make(chan struct{})
 			var kept any
 			func() {
-				env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1, Prior: testPrior}, nil)
+				env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1}, nil)
 				defer closeManual(t, env.c, env.ex)
 				sentinel := new([1024]byte)
 				runtime.SetFinalizer(sentinel, func(*[1024]byte) { close(done) })
@@ -123,7 +123,7 @@ func TestSettledHandlesReleaseCache(t *testing.T) {
 }
 
 func TestInvalidAndCanceledContextsDoNotAdmitWork(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1, Prior: testPrior}, nil)
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1}, nil)
 	defer closeManual(t, env.c, env.ex)
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -143,7 +143,7 @@ func TestInvalidAndCanceledContextsDoNotAdmitWork(t *testing.T) {
 	}
 	env.drive()
 	st := env.c.Stats()
-	if st.Loads != 0 || st.Samples != 0 || st.KeyInvalidations != 0 || st.NamespaceInvalidations != 0 {
+	if st.Loads != 0 || st.KeyInvalidations != 0 || st.NamespaceInvalidations != 0 {
 		t.Fatalf("invalid calls performed work: %+v", st)
 	}
 	if err := env.c.Close(nil); !errors.Is(err, ErrNilContext) || env.c.CloseProgress().Stopped {
@@ -158,7 +158,7 @@ func TestInvalidAndCanceledContextsDoNotAdmitWork(t *testing.T) {
 }
 
 func TestFutureTerminalPollingAndNilContext(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1, Prior: testPrior}, nil)
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1}, nil)
 	defer closeManual(t, env.c, env.ex)
 	f, err := env.ns.FetchAsync("key", okLoader("v"))
 	if err != nil {
@@ -186,7 +186,7 @@ func TestFutureTerminalPollingAndNilContext(t *testing.T) {
 }
 
 func TestConcurrentFutureTakeReportsOneResult(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1, Prior: testPrior}, nil)
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1}, nil)
 	defer closeManual(t, env.c, env.ex)
 	f, err := env.ns.FetchAsync("key", okLoader("v"))
 	if err != nil {
@@ -223,7 +223,7 @@ func TestConcurrentFutureTakeReportsOneResult(t *testing.T) {
 }
 
 func TestCachedFuturesHaveIndependentLifetimes(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1, Prior: testPrior}, nil)
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1}, nil)
 	defer closeManual(t, env.c, env.ex)
 	if _, err := env.fetch("key", okLoader("v")); err != nil {
 		t.Fatal(err)
@@ -292,9 +292,6 @@ func TestUninitializedPublicHandlesAreSafe(t *testing.T) {
 		if _, lost := c.HotWindowsSince(0); lost != 0 {
 			t.Fatal("uninitialized history lost data")
 		}
-		if _, ok := c.Credits(); ok {
-			t.Fatal("uninitialized credit snapshot succeeded")
-		}
 		for _, err := range []error{c.Close(ctx), c.WaitDrained(ctx), c.WaitReclaimed(ctx)} {
 			if !errors.Is(err, ErrUninitialized) {
 				t.Fatal(err)
@@ -318,12 +315,6 @@ func TestUninitializedPublicHandlesAreSafe(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := n.InvalidateAsync("key"); !errors.Is(err, ErrUninitialized) {
-			t.Fatal(err)
-		}
-		if err := n.SetPrior(nil); !errors.Is(err, ErrUninitialized) {
-			t.Fatal(err)
-		}
-		if err := n.SetModel(nil); !errors.Is(err, ErrUninitialized) {
 			t.Fatal(err)
 		}
 		if _, ok := n.Heat("key"); ok {
@@ -363,9 +354,16 @@ func TestUninitializedPublicHandlesAreSafe(t *testing.T) {
 	}
 }
 
-func TestObserveOnlyMinimalConfigurationAndModelReset(t *testing.T) {
+func TestModeObserveMinimalConfiguration(t *testing.T) {
 	ex := NewManualExecutor()
-	c, err := New[string](Config{ObserveOnly: true, DisableTicker: true, Executor: ex, Namespaces: map[string]NamespaceConfig{"t": {}}})
+	c, err := NewBytes[string](Config{
+		Mode:       ModeObserve,
+		Namespaces: map[string]NamespaceConfig{"t": {}},
+		Runtime: RuntimeConfig{
+			DisableTicker: true,
+			Executor:      ex,
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,19 +378,10 @@ func TestObserveOnlyMinimalConfigurationAndModelReset(t *testing.T) {
 	if heat, ok := n.Heat("key"); !ok || heat != 1 {
 		t.Fatal(heat, ok)
 	}
-	if err := n.SetModel(failModel{}); err != nil {
-		t.Fatal(err)
-	}
-	if err := n.SetModel(nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := n.ns.model.Load().m.(hitCountModel); !ok {
-		t.Fatal("nil model did not restore the constructor default")
-	}
 }
 
 func TestAllocationFreeRejectedAndEmptyQueries(t *testing.T) {
-	e := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1, Prior: testPrior}, func(c *Config) { c.SampleP = 1e-12; c.MaxWaitersTotal = 1; c.MaxOwnedHandles = 4 })
+	e := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1}, func(c *Config) { c.Limits.MaxWaitersTotal = 1; c.Limits.MaxOwnedHandles = 4 })
 	defer closeManual(t, e.c, e.ex)
 	if _, err := e.fetch("key", okLoader("v")); err != nil {
 		t.Fatal(err)
@@ -428,23 +417,11 @@ func TestAllocationFreeRejectedAndEmptyQueries(t *testing.T) {
 	}
 }
 
-func TestModelAndOptionConfigurationErrorsAreExplicit(t *testing.T) {
-	for _, cfg := range []CostTableConfig{
-		{}, {MergeFactor: 2}, {Classes: 65, MergeFactor: 1}, {Alpha: -1, MergeFactor: 1},
-		{MergeFactor: 1, Unit: "cpu"}, {MergeFactor: 1, MaxAge: -time.Second},
-		{Classes: 1, RateBands: []RateBand{{CostClass: 1, MaxLambda: 1}}},
-		{RateBands: []RateBand{{MaxLambda: 1}, {MaxLambda: 1}}},
-	} {
-		if m, err := NewCostTableModel(cfg); m != nil || !errors.Is(err, ErrInvalidConfig) {
-			t.Fatalf("invalid model accepted: %+v %v", cfg, err)
-		}
+func TestOptionConfigurationErrorsAreExplicit(t *testing.T) {
+	if c, err := NewBytes[string](validConfig(), nil); c != nil || !errors.Is(err, ErrInvalidConfig) {
+		t.Fatal("nil option accepted", err)
 	}
-	for _, opts := range [][]Option[string]{{nil}, {WithWeigher[string](nil)}} {
-		if c, err := New[string](validConfig(), opts...); c != nil || !errors.Is(err, ErrInvalidConfig) {
-			t.Fatal("invalid option accepted", err)
-		}
-	}
-	e := newTestEnv(t, NamespaceConfig{TTL: time.Minute}, func(c *Config) { c.MaxNamespaces = 1 })
+	e := newTestEnv(t, NamespaceConfig{TTL: time.Minute}, func(c *Config) { c.Limits.MaxNamespaces = 1 })
 	defer closeManual(t, e.c, e.ex)
 	if _, err := e.c.RegisterNamespace("t", NamespaceConfig{TTL: time.Minute}); !errors.Is(err, ErrNamespaceExists) {
 		t.Fatal(err)
@@ -452,17 +429,11 @@ func TestModelAndOptionConfigurationErrorsAreExplicit(t *testing.T) {
 	if _, err := e.c.RegisterNamespace("new", NamespaceConfig{TTL: time.Minute}); !errors.Is(err, ErrOverloaded) {
 		t.Fatal(err)
 	}
-	if err := e.ns.SetModel(&CostTableModel{}); !errors.Is(err, ErrInvalidConfig) {
-		t.Fatal("zero model accepted", err)
-	}
-	if err := e.ns.SetPrior(&Prior{Lambda: -1}); !errors.Is(err, ErrInvalidConfig) {
-		t.Fatal(err)
-	}
 }
 
 func TestFullControlQueuesRejectWithoutAllocation(t *testing.T) {
 	for _, namespace := range []bool{false, true} {
-		e := newTestEnv(t, NamespaceConfig{TTL: time.Minute}, func(c *Config) { c.ShardCount, c.ControlQueueSize = 1, 1 })
+		e := newTestEnv(t, NamespaceConfig{TTL: time.Minute}, func(c *Config) { c.Shards, c.Limits.ControlQueueSize = 1, 1 })
 		defer closeManual(t, e.c, e.ex)
 		submit := func() (*ControlHandle, error) {
 			if namespace {

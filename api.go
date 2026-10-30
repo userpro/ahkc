@@ -26,6 +26,7 @@ type Request[V any] struct {
 	sh           *shard[V]
 	heatRecorded bool
 	counted      bool
+	shadowHit    bool // 影子缓存：本请求已虚拟命中（见 lookup）
 }
 
 // go vet 检查含生命周期的公开对象被按值复制；标记不占运行期存储。
@@ -71,58 +72,16 @@ func (n *Namespace[V]) beginRequest(r *Request[V], key string) error {
 	s := c.shardOf(kh)
 	// 逐字段写入：整体复合字面量赋值在泛型 shape 下会经 typedmemmove 带写屏障检查。
 	r.ns, r.key, r.keyHash, r.sh = n.ns, key, kh, s
-	r.heatRecorded, r.counted = false, false
-	// 收益样本与请求热点样本一次逻辑请求各至多一次。
-	// 二者共用同一次随机抽样（各自边际概率正确）：u < sampleThreshold 为收益样本，
-	// u < reqThreshold 为追踪样本，外层只比较 drawThreshold = max(两者)。
-	// 被抽中的请求共用一次时钟读取。
-	if c.state.Load() == cacheOpen {
-		ns := n.ns
-		var benefit, track bool
-		if ns.sampleAll {
-			benefit = true
-			track = ns.reqThreshold != 0 && rand.Uint64() < ns.reqThreshold
-		} else if u := rand.Uint64(); u < ns.drawThreshold {
-			benefit, track = u < ns.sampleThreshold, u < ns.reqThreshold
-		}
-		if benefit || track {
-			now := c.now()
-			if benefit {
-				g := ns.gen.Load()
-				sm := sample{
-					nsID: ns.id, policyHash: policyHash(kh, g), nsGen: g,
-					eventTime: now, invP: ns.sampleInvP,
-				}
-				if s.pushSample(kh, sm) {
-					s.cnt.samples.Add(1)
-					c.signalMaintenance(s)
-				}
-			}
-			if track {
-				s.req.record(ns.id, kh, key, now)
-			}
-		}
+	r.heatRecorded, r.counted, r.shadowHit = false, false, false
+	// 请求热点追踪：关闭时 reqThreshold 为 0，命中路径不抽随机数、不读时钟。
+	if ns := n.ns; ns.reqThreshold != 0 && c.state.Load() == cacheOpen && rand.Uint64() < ns.reqThreshold {
+		s.req.record(ns.id, kh, key, c.now())
 	}
 	return nil
 }
 
 func (n *Namespace[V]) validRequest(r *Request[V]) bool {
 	return n != nil && n.ns != nil && r != nil && r.ns == n.ns
-}
-
-// pushSample 从 key 对应的条带起依次尝试全部条带（每条带一次非阻塞尝试，总次数有界）。
-// 只有全部条带都竞争失败或已满才放弃样本并在起始条带置丢样标记；
-// 否则同一热 key 的并发请求会在固定条带上集中丢样，使丢样与热点相关并反复污染估值窗口。
-func (s *shard[V]) pushSample(kh uint64, sm sample) bool {
-	n := len(s.stripes)
-	start := int(mix64(kh) % uint64(n))
-	for i := 0; i < n; i++ {
-		if s.stripes[(start+i)%n].tryPushQuiet(sm) {
-			return true
-		}
-	}
-	s.stripes[start].faultFlag.Store(true)
-	return false
 }
 
 type readStatus int
@@ -143,7 +102,7 @@ type readResult[V any] struct {
 // 命中时 guard 仍然有效，调用方必须读取所需字段后 unpin（或把 guard 交给 Borrowed）。
 type lookupResult[V any] struct {
 	status readStatus
-	e      *entry[V]
+	e      *entry
 	g      guard
 }
 
@@ -160,27 +119,38 @@ func (c *cache[V]) lookup(r *Request[V]) lookupResult[V] {
 	if !ok {
 		return lookupResult[V]{status: readBusy}
 	}
-	fr := s.idx.find(r.key, r.keyHash, r.ns.id)
-	t := c.now()
+	// 先 pin 再复核状态：RECLAIMED 要求没有任何 pin，且状态早已离开 OPEN，
+	// 所以通过复核的读者一定先于内存区释放。
 	if c.state.Load() != cacheOpen {
 		g.unpin()
 		return lookupResult[V]{status: readClosed}
 	}
+	fr := s.idx.find(r.key, r.keyHash, r.ns.id)
+	t := c.now()
 	if !fr.found {
 		g.unpin()
 		c.recordHeatOnce(r, false, nil, t)
 		return lookupResult[V]{status: readMiss}
 	}
 	e := fr.e
-	if !e.readable.Load() || e.nsGen != r.ns.gen.Load() || t >= e.hardDeadline {
+	if !e.isReadable() || !e.genIs(r.ns.gen.Load()) || t >= e.hardDeadline {
 		g.unpin()
+		// 提示维护者退休它：槽号加一，0 表示无提示；丢失只推迟退场，读时校验仍保证不交付。
+		if h, v := &s.hints[r.keyHash>>58], uint32(fr.slot)+1; h.Load() != v { // 热 key 反复读到同一条过期条目时只读不写，免得争用缓存行
+			h.Store(v)
+		}
 		c.recordHeatOnce(r, false, nil, t)
 		return lookupResult[V]{status: readMiss}
 	}
 	// 有效命中：驻留热度与 visited 是条目状态，必须在释放 guard 前更新。
 	c.recordHeatOnce(r, true, e, t)
-	if !e.visited.Load() {
-		e.visited.Store(true)
+	e.markVisited()
+	if c.cfg.shadow() {
+		// 影子命中：热度与 visited 已与真实缓存同样演化；只计一次命中，对调用方按 miss 回源。
+		g.unpin()
+		r.countLookup(true)
+		r.shadowHit = true
+		return lookupResult[V]{status: readMiss}
 	}
 	return lookupResult[V]{status: readHit, e: e, g: g}
 }
@@ -200,12 +170,12 @@ func (c *cache[V]) readOwned(r *Request[V]) readResult[V] {
 }
 
 // acquireHandle 先取得额度和 pin，再分配；调用方须持有 guard 或已有句柄。
-func (c *cache[V]) acquireHandle(e *entry[V]) (*Handle[V], error) {
+func (c *cache[V]) acquireHandle(e *entry) (*Handle[V], error) {
 	var rc receipt
 	if !c.handleBudget.reserveUnitInto(&rc) {
 		return nil, ErrBusy
 	}
-	if !e.tryPin(c.cfg.MaxOwnedPinsPerEntry) {
+	if !e.tryPin(int32(c.cfg.Limits.MaxOwnedPinsPerEntry)) {
 		rc.returnOnce()
 		return nil, ErrBusy
 	}
@@ -215,17 +185,17 @@ func (c *cache[V]) acquireHandle(e *entry[V]) (*Handle[V], error) {
 }
 
 // recordHeatOnce 一次逻辑请求至多记录一次 hit/miss 热度（I11）。
-func (c *cache[V]) recordHeatOnce(r *Request[V], hit bool, e *entry[V], t int64) {
+func (c *cache[V]) recordHeatOnce(r *Request[V], hit bool, e *entry, t int64) {
 	if r.heatRecorded {
 		return
 	}
 	r.heatRecorded = true
-	delta := int64(c.cfg.HeatDelta)
+	delta := int64(c.cfg.Heat.Delta)
 	be := bucketIndex(t, delta)
 	if hit {
-		e.heat.add(be, c.cfg.HeatCap, c.cfg.HeatRetries)
+		e.heat.add(be, heatCountMax, heatRetries)
 	} else {
-		r.sh.gate.add(r.keyHash, be, c.cfg.HeatCap, c.cfg.HeatRetries)
+		r.sh.gate.add(r.keyHash, be)
 	}
 }
 
@@ -257,9 +227,9 @@ func (n *Namespace[V]) getOn(r *Request[V]) (V, bool, error) {
 	var zero V
 	switch lr.status {
 	case readHit:
-		// A returned Go value belongs to the caller. Use BorrowOn for a scoped view
-		// whose retention remains inside the cache's accounting domain.
-		v := lr.e.value
+		// 返回给调用方的值归调用方独占：字节布局在 guard 内拷贝出一份再退出 guard。
+		// 需要零拷贝时使用 BorrowOn。
+		v := c.copyOut(lr.e)
 		lr.g.unpin()
 		r.countLookup(true)
 		return v, true, nil
@@ -287,7 +257,7 @@ func (n *Namespace[V]) Get(key string) (V, bool, error) {
 // Handle 是拥有型句柄：跨线程/异步持有 value。用完必须 Release。
 type Handle[V any] struct {
 	mu    sync.Mutex
-	e     *entry[V]
+	e     *entry
 	owner *cache[V]
 	rc    receipt // 句柄槽位凭证，内嵌以避免每次拥有型命中额外分配
 }
@@ -304,7 +274,7 @@ func (h *Handle[V]) Value() V {
 		var zero V
 		return zero
 	}
-	return h.e.value
+	return h.owner.view(h.e)
 }
 
 // Clone creates an independent owned handle, including after invalidation.
@@ -344,7 +314,7 @@ func (h *Handle[V]) Release() {
 // released before reuse. Do not copy it; Clone obtains independent ownership.
 type Borrowed[V any] struct {
 	_     noCopy
-	e     *entry[V]
+	e     *entry
 	guard guard
 	owner *cache[V]
 }
@@ -354,7 +324,7 @@ func (b *Borrowed[V]) Value() V {
 		var zero V
 		return zero
 	}
-	return b.e.value
+	return b.owner.view(b.e)
 }
 
 func (b *Borrowed[V]) Release() {
@@ -560,8 +530,6 @@ type controlKind uint8
 
 const (
 	ctlInvalidateKey controlKind = iota
-	ctlCreditTake
-	ctlCreditApply
 	ctlInvalidateNS
 )
 
@@ -571,13 +539,10 @@ type controlOp[V any] struct {
 	key     string
 	keyHash uint64
 	ns      *namespace[V]
-	amountN int64
-	amountB int64
 	result  controlResult // 内嵌完成单元：操作与确认凭证一次分配
 	handle  ControlHandle
 	rc      receipt // 控制预算凭证（内嵌）
 	claimed atomic.Bool
-	grantID uint64
 }
 
 // newControlOp 构造控制操作：先取得控制额度再分配，过载拒绝路径无堆分配。

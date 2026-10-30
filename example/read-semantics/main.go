@@ -21,11 +21,11 @@ import (
 func main() {
 	ctx := context.Background()
 
-	c, err := ahkc.New[string](ahkc.Config{
-		MaxEntries:       1024,
-		MaxResidentBytes: 64 << 20,
+	c, err := ahkc.NewBytes[string](ahkc.Config{
+		MaxEntries: 1024,
+		MaxBytes:   64 << 20,
 		Namespaces: map[string]ahkc.NamespaceConfig{
-			"doc": {TTL: time.Hour, Tin: 1, Prior: &ahkc.Prior{Lambda: 10}},
+			"doc": {TTL: time.Hour, Tin: 1},
 		},
 	})
 	if err != nil {

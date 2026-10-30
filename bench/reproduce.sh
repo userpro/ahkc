@@ -23,8 +23,7 @@
 #   mixed-repeat-load.json  同上，第二随机种子
 #   skew-load.json          99.9% 集中 / 64 key
 #   owned-load.json         95/3/2 混合拥有型
-#   skew-4096keys-load.json 失败样本：默认 4096 key 长尾冷却被判 miss
-#   policy-replay.json / calibration.json / search-oracle.json  模型报告
+#   policy-replay.json / search-oracle.json  模型报告
 #   summary.json           上述压测场景汇总 + 是否达标
 #
 # 证据边界：报告绑定 environment.json 的 SourceSHA256。换机器/换代码后必须重跑，
@@ -123,7 +122,7 @@ run_load() {
     return 0
   fi
   if [ "$expectation" = "expected" ]; then
-    echo "    FAIL $name（预期：失败样本，长尾冷却被判 miss）"
+    echo "    FAIL $name（预期失败的样本）"
     return 0
   fi
   echo "    FAIL $name（见 $OUT/load-$name.log）"
@@ -136,16 +135,14 @@ run_load mixed-load required -scenario mixed
 run_load mixed-repeat-load required -scenario mixed -seed 20261002
 run_load skew-load required -scenario mixed -hot-percent 99.9 -keys 64
 run_load owned-load required -scenario mixed -read-mode owned
-run_load skew-4096keys-load expected -scenario mixed -hot-percent 99.9
 
 # ------------------------------------------------------------ [5/6] 模型
-echo "==> [5/6] 模型报告（策略回放 / 合并率校准 / 有限搜索 oracle）"
+echo "==> [5/6] 模型报告（策略回放 / 有限搜索 oracle）"
 AHKC_REPLAY_REPORT="$OUT/policy-replay.json" \
-AHKC_CALIBRATION_REPORT="$OUT/calibration.json" \
 AHKC_ORACLE_REPORT="$OUT/search-oracle.json" \
-go test -run 'Test(SyntheticPolicyReplay|BoundedSearchAgainstFullResidentOracle|NoCacheSingleflightCalibration)$' -count=1 \
+go test -run 'Test(SyntheticPolicyReplay|BoundedSearchAgainstFullResidentOracle)$' -count=1 \
   >"$OUT/model.log" 2>&1 || { echo "    FAIL 模型报告（见 $OUT/model.log）"; STATUS=1; }
-for f in policy-replay calibration search-oracle; do
+for f in policy-replay search-oracle; do
   [ -f "$OUT/$f.json" ] && echo "    PASS $f.json"
 done
 
@@ -156,8 +153,7 @@ python3 bench/report.py summary "$OUT/summary.json" \
   "$OUT/mixed-load.json" \
   "$OUT/mixed-repeat-load.json" \
   "$OUT/skew-load.json" \
-  "$OUT/owned-load.json" \
-  "$OUT/skew-4096keys-load.json" || STATUS=1
+  "$OUT/owned-load.json" || STATUS=1
 
 python3 - "$OUT/summary.json" <<'PY'
 import json, sys

@@ -23,6 +23,7 @@ type histogram struct {
 	Buckets                                                [12601]uint64
 	MaxNS                                                  int64
 	Total, Success, Hits, Misses, Errors, Busy, Overloaded uint64
+	FirstError                                             string
 }
 
 func (h *histogram) record(ns int64, err error, hit bool) {
@@ -49,6 +50,9 @@ func (h *histogram) record(ns int64, err error, hit bool) {
 		}
 	} else {
 		h.Errors++
+		if h.FirstError == "" {
+			h.FirstError = err.Error()
+		}
 	}
 }
 
@@ -88,6 +92,11 @@ type result struct {
 	P50NS, P95NS, P99NS, MaxNS                                               int64
 	Requests, Successes, Errors, Busy, Overloaded, SourceLoads, SourceMerged uint64
 	Hits, Misses                                                             uint64
+	FirstError                                                               string
+	Entries                                                                  int64
+	ValueMin, ValueMax, HotSlots                                             int
+	HotSamplesDropped                                                        uint64
+	PinSlotsExhausted, PinEpochRetriesExhausted                              uint64
 	LoadDelayNS                                                              int64
 	MissPercent, SourcePercent                                               int
 	MaxManaged                                                               ahkc.MemoryLimits
@@ -155,22 +164,52 @@ func main() {
 	minimum := flag.Float64("min-qps", 1_000_000, "minimum successful throughput")
 	maximum := flag.Duration("max-p99", 3*time.Millisecond, "maximum full scheduled-to-completion P99")
 	output := flag.String("output", "", "optional JSON report path")
+	entries := flag.Int64("entries", 0, "cache capacity in entries; 0 means keys*4")
+	valueMin := flag.Int("value-min", 0, "minimum loader value bytes; 0 keeps the short value:<key> payload")
+	valueMax := flag.Int("value-max", 0, "maximum loader value bytes (uniform in [value-min,value-max])")
+	hotSlots := flag.Int("hot-slots", 0, "per-shard request hot-key tracking slots (1s history windows, sampled at 1/16); 0 disables")
+	prefault := flag.Bool("prefault", false, "touch index and gate memory at startup")
+	hugePages := flag.Bool("hugepages", false, "advise transparent huge pages for the reserved regions")
 	flag.Parse()
 	if *rate <= 0 || *rate > 1_000_000_000 || *workers <= 0 || *workers > 4096 || *keys <= 0 || *keys > 1<<20 || *shards < 1 || *shards > 65536 || *duration < time.Millisecond || *duration > 7*24*time.Hour ||
 		(*scenario != "hot" && *scenario != "mixed") || *missPercent < 0 || *sourcePercent < 0 ||
 		*missPercent+*sourcePercent > 100 || *loadDelay < 0 ||
 		(*readMode != "borrow" && *readMode != "value" && *readMode != "owned") || math.IsNaN(*hotPercent) || *hotPercent < 0 || *hotPercent > 100 ||
-		math.IsNaN(*minimum) || math.IsInf(*minimum, 0) || *minimum <= 0 || *maximum <= 0 {
+		math.IsNaN(*minimum) || math.IsInf(*minimum, 0) || *minimum <= 0 || *maximum <= 0 ||
+		*entries < 0 || *valueMin < 0 || *valueMax < *valueMin || *valueMax > 1<<20 || *hotSlots < 0 {
 		fmt.Fprintln(os.Stderr, "invalid load configuration")
 		os.Exit(2)
 	}
-	cfg := ahkc.Config{
-		ShardCount: *shards, MaxEntries: int64(*keys) * 4, MaxResidentBytes: int64(*keys) * 2048,
-		MaxEntryBytes: 512, MaxResultBytes: 512, MaxConcurrentLoads: 1024,
-		MaxTTL:     *duration + time.Hour,
-		Namespaces: map[string]ahkc.NamespaceConfig{"load": {TTL: *duration + time.Hour, Tin: 1, Prior: &ahkc.Prior{Lambda: 100}}}, Advanced: ahkc.Advanced{MaxWaitersTotal: 4096, RetiredRecords: 1024, FillQueueSize: 128},
+	capacity, entryBytes, perEntry := int64(*keys)*4, int64(512), int64(2048)/4
+	if *entries > 0 {
+		capacity = *entries
 	}
-	cache, err := ahkc.New[string](cfg, ahkc.WithResultMetadata[string](func(key, _ string) ahkc.ResultMetadata {
+	if *valueMax > 0 {
+		entryBytes = int64(*valueMax) + 512
+		perEntry = int64(*valueMin+*valueMax)/2 + 256
+	}
+	cfg := ahkc.Config{
+		Shards:         *shards,
+		MaxEntries:     capacity,
+		MaxBytes:       capacity * perEntry,
+		MaxEntryBytes:  entryBytes,
+		MaxResultBytes: entryBytes,
+		Namespaces:     map[string]ahkc.NamespaceConfig{"load": {TTL: *duration + time.Hour, Tin: 1}},
+		Memory: ahkc.MemoryConfig{
+			Prefault:  *prefault,
+			HugePages: *hugePages,
+		},
+		Limits: ahkc.LimitsConfig{
+			MaxConcurrentLoads: 1024,
+			MaxWaitersTotal:    4096,
+			FillQueueSize:      128,
+		},
+	}
+	if *hotSlots > 0 {
+		cfg.Hot.RequestSlots, cfg.Hot.RequestSampleP = *hotSlots, 1.0/16
+		cfg.Hot.Windows, cfg.Hot.Interval = 4, time.Second
+	}
+	cache, err := ahkc.NewBytes[string](cfg, ahkc.WithResultMetadata[string](func(key, _ string) ahkc.ResultMetadata {
 		return ahkc.ResultMetadata{NoCache: strings.HasPrefix(key, "source/")}
 	}))
 	if err != nil {
@@ -183,6 +222,10 @@ func main() {
 	loader := func(_ context.Context, key string) (string, error) {
 		if strings.HasPrefix(key, "source/") && *loadDelay > 0 {
 			time.Sleep(*loadDelay)
+		}
+		if *valueMax > 0 { // 确定性变长值：长度由 key 决定，便于核对
+			n := *valueMin + int(next(uint64(len(key))*0x9e3779b97f4a7c15+uint64(key[len(key)-1]))%uint64(*valueMax-*valueMin+1))
+			return strings.Repeat(key+"|", n/(len(key)+1)+1)[:n], nil
 		}
 		return "value:" + key, nil
 	}
@@ -296,6 +339,9 @@ func main() {
 		combined.Errors += h.Errors
 		combined.Busy += h.Busy
 		combined.Overloaded += h.Overloaded
+		if combined.FirstError == "" {
+			combined.FirstError = h.FirstError
+		}
 		if h.MaxNS > combined.MaxNS {
 			combined.MaxNS = h.MaxNS
 		}
@@ -310,7 +356,10 @@ func main() {
 		SuccessfulQPS: float64(combined.Success) / elapsed, CompletedQPS: float64(combined.Total) / elapsed,
 		P50NS: combined.percentile(50), P95NS: combined.percentile(95), P99NS: combined.percentile(99), MaxNS: combined.MaxNS,
 		Requests: combined.Total, Successes: combined.Success, Errors: combined.Errors, Busy: combined.Busy, Overloaded: combined.Overloaded,
-		Hits: combined.Hits, Misses: combined.Misses,
+		Hits: combined.Hits, Misses: combined.Misses, FirstError: combined.FirstError,
+		Entries: capacity, ValueMin: *valueMin, ValueMax: *valueMax, HotSlots: *hotSlots,
+		HotSamplesDropped: after.HotRequestSamplesDropped - before.HotRequestSamplesDropped,
+		PinSlotsExhausted: after.PinSlotsExhausted - before.PinSlotsExhausted, PinEpochRetriesExhausted: after.PinEpochRetriesExhausted - before.PinEpochRetriesExhausted,
 		SourceLoads: after.Loads - before.Loads, SourceMerged: after.LoadMerged - before.LoadMerged,
 		LoadDelayNS: int64(*loadDelay), MissPercent: *missPercent, SourcePercent: *sourcePercent, MaxManaged: cache.MemoryLimits(),
 		HeapAlloc: memoryAfter.HeapAlloc, HeapInUse: memoryAfter.HeapInuse, TotalAllocBytes: memoryAfter.TotalAlloc - memoryBefore.TotalAlloc,

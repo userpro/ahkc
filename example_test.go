@@ -39,12 +39,14 @@ func fetchAsyncRetry[V any](ns *ahkc.Namespace[V], key string, loader ahkc.Loade
 
 // Example 演示最小用法：创建实例、注册命名空间、查询并加载、只读命中、失效。
 func Example() {
-	c, err := ahkc.New[string](ahkc.Config{
-		Clock:            ahkc.NewManualClock(int64(time.Second)), // 固定示例时间；生产默认真实单调时钟
-		MaxEntries:       1024,
-		MaxResidentBytes: 64 << 20,
+	c, err := ahkc.NewBytes[string](ahkc.Config{
+		MaxEntries: 1024,
+		MaxBytes:   64 << 20,
 		Namespaces: map[string]ahkc.NamespaceConfig{
-			"user": {TTL: time.Minute, Tin: 1, Prior: &ahkc.Prior{Lambda: 10}},
+			"user": {TTL: time.Minute, Tin: 1},
+		},
+		Runtime: ahkc.RuntimeConfig{
+			Clock: ahkc.NewManualClock(int64(time.Second)), // 固定示例时间；生产默认真实单调时钟
 		},
 	})
 	if err != nil {
@@ -99,11 +101,11 @@ func waitPublished(c *ahkc.Cache[string]) {
 
 // ExampleNamespace_FetchAsync 演示异步加载与 singleflight 合并。
 func ExampleNamespace_FetchAsync() {
-	c, _ := ahkc.New[string](ahkc.Config{
-		MaxEntries:       1024,
-		MaxResidentBytes: 64 << 20,
+	c, _ := ahkc.NewBytes[string](ahkc.Config{
+		MaxEntries: 1024,
+		MaxBytes:   64 << 20,
 		Namespaces: map[string]ahkc.NamespaceConfig{
-			"doc": {TTL: time.Minute, Tin: 1, Prior: &ahkc.Prior{Lambda: 10}},
+			"doc": {TTL: time.Minute, Tin: 1},
 		},
 	})
 	defer c.Close(context.Background())
@@ -130,12 +132,14 @@ func ExampleNamespace_FetchAsync() {
 
 // ExampleCache_Stats 演示指标快照。
 func ExampleCache_Stats() {
-	c, _ := ahkc.New[string](ahkc.Config{
-		Clock:            ahkc.NewManualClock(int64(time.Second)),
-		MaxEntries:       1024,
-		MaxResidentBytes: 64 << 20,
+	c, _ := ahkc.NewBytes[string](ahkc.Config{
+		MaxEntries: 1024,
+		MaxBytes:   64 << 20,
 		Namespaces: map[string]ahkc.NamespaceConfig{
-			"k": {TTL: time.Minute, Tin: 1, Prior: &ahkc.Prior{Lambda: 10}},
+			"k": {TTL: time.Minute, Tin: 1},
+		},
+		Runtime: ahkc.RuntimeConfig{
+			Clock: ahkc.NewManualClock(int64(time.Second)),
 		},
 	})
 	defer c.Close(context.Background())
@@ -157,13 +161,14 @@ func ExampleCache_Stats() {
 
 // ExampleCache_HotKeys 演示仅统计不缓存模式：观测高度重复的数据。
 func ExampleCache_HotKeys() {
-	c, _ := ahkc.New[string](ahkc.Config{
-		ObserveOnly:      true,
-		MaxEntries:       1024,
-		MaxResidentBytes: 64 << 20,
+	c, _ := ahkc.NewBytes[string](ahkc.Config{
+		Mode:       ahkc.ModeObserve,
+		MaxEntries: 1024,
+		MaxBytes:   64 << 20,
 		Namespaces: map[string]ahkc.NamespaceConfig{
 			"user": {TTL: time.Minute, Tin: 3},
 		},
+		Hot: ahkc.HotConfig{LoadSlots: 128},
 	})
 	defer c.Close(context.Background())
 	ns, _ := c.Namespace("user")
@@ -208,15 +213,19 @@ func ExampleCache_HotKeys() {
 }
 
 // ExampleCache_HotKeyHistory 演示窗口摘要历史：每个热度窗口结束时
-// 保留一份榜单快照（默认窗口宽 HeatDelta=1s，由内置周期维护滚动）。
+// 保留一份榜单快照（默认窗口宽 Heat.Delta=1s，由内置周期维护滚动）。
 func ExampleCache_HotKeyHistory() {
-	c, _ := ahkc.New[string](ahkc.Config{
-		ObserveOnly:      true,
-		MaxEntries:       1024,
-		MaxResidentBytes: 64 << 20,
+	c, _ := ahkc.NewBytes[string](ahkc.Config{
+		Mode:       ahkc.ModeObserve,
+		MaxEntries: 1024,
+		MaxBytes:   64 << 20,
 		Namespaces: map[string]ahkc.NamespaceConfig{
 			"user": {TTL: time.Minute, Tin: 3},
-		}, Advanced: ahkc.Advanced{ObserveHotKeys: 16, HotHistoryWindows: 2},
+		},
+		Hot: ahkc.HotConfig{
+			LoadSlots: 16,
+			Windows:   2,
+		},
 	})
 	defer c.Close(context.Background())
 	ns, _ := c.Namespace("user")
@@ -241,23 +250,4 @@ func ExampleCache_HotKeyHistory() {
 
 	// Output:
 	// u-1: loads=3
-}
-
-// ExampleNewCostTableModel 演示有界查表成本模型：以观测的加载成本做收益估值。
-func ExampleNewCostTableModel() {
-	model, err := ahkc.NewCostTableModel(ahkc.CostTableConfig{
-		Classes:     4,
-		MaxAge:      time.Minute,
-		MergeFactor: 1,
-	})
-	if err != nil {
-		panic(err)
-	}
-	// 宿主以实测口径上报（或默认由库以 loader 墙钟时长自动观测）。
-	model.Observe(0, 0.02) // 类别 0 单次可避免成本 0.02 收益单位
-	r, c, h, k, K, ok := model.Lookup(100, 0)
-	fmt.Println("ok:", ok, "r:", r, "c:", c, "h:", h, "k:", k, "K:", K)
-
-	// Output:
-	// ok: true r: 100 c: 0.02 h: 0 k: 0 K: 0
 }

@@ -13,29 +13,36 @@ import (
 func main() {
 	for _, mode := range []struct {
 		name  string
-		only  bool
+		mode  ahkc.Mode
 		track bool
 	}{
-		{"仅缓存", false, false},
-		{"仅统计", true, true},
-		{"组合", false, true},
+		{"仅缓存", ahkc.ModeCache, false},
+		{"仅统计", ahkc.ModeObserve, true},
+		{"组合", ahkc.ModeCache, true},
 	} {
 		clock := ahkc.NewManualClock(int64(time.Second))
 		executor := ahkc.NewManualExecutor()
 		notifications := 0
 		cfg := ahkc.Config{
-			ShardCount: 1, MaxEntries: 64, MaxResidentBytes: 4 << 20,
-			ObserveOnly: mode.only, Clock: clock, Executor: executor, DisableTicker: true,
+			Shards:     1,
+			MaxEntries: 64,
+			MaxBytes:   4 << 20,
+			Mode:       mode.mode,
 			Namespaces: map[string]ahkc.NamespaceConfig{
-				"demo": {TTL: time.Minute, Tin: 1, Prior: &ahkc.Prior{Lambda: 10}},
+				"demo": {TTL: time.Minute, Tin: 1},
+			},
+			Runtime: ahkc.RuntimeConfig{
+				Clock:         clock,
+				Executor:      executor,
+				DisableTicker: true,
 			},
 		}
 		if mode.track {
-			cfg.ObserveHotKeys, cfg.ObserveRequestKeys = 8, 8
-			cfg.ObserveRequestSampleP, cfg.HotHistoryWindows = 1, 2
-			cfg.OnHotWindow = func(ahkc.HotSnapshot) { notifications++ }
+			cfg.Hot.LoadSlots, cfg.Hot.RequestSlots = 8, 8
+			cfg.Hot.RequestSampleP, cfg.Hot.Windows = 1, 2
+			cfg.Hot.OnWindow = func(ahkc.HotSnapshot) { notifications++ }
 		}
-		c, err := ahkc.New[string](cfg)
+		c, err := ahkc.NewBytes[string](cfg)
 		must(err)
 		ns, err := c.Namespace("demo")
 		must(err)
@@ -59,7 +66,7 @@ func main() {
 		for i := 0; i < 2; i++ {
 			_, hit, err := ns.Get("hot")
 			must(err)
-			if hit == mode.only {
+			if hit == (mode.mode == ahkc.ModeObserve) {
 				panic("unexpected cache behavior")
 			}
 		}

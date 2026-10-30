@@ -1,178 +1,70 @@
 package ahkc
 
-import (
-	"sync"
-	"sync/atomic"
-)
+// 条目退休与回收：摘链后挂入分片的侵入式退休链（tryRetire），
+// 由维护者按配额推进安全释放（reclaimStep）。
+//
+// 没有独立的退休预算：条目区本身就是上限，退休块尚未回收时新的分配失败会被
+// 优雅拒绝，天然限流。所有操作只在分片维护者上执行。
 
-// 条目退休与回收：摘链登记退休记录（tryRetire）、按配额推进安全释放（reclaimStep）。
-// 由单维护者调用；释放在回收执行器上进行，不进入索引 / Flight / 维护临界区。
-
-// tryRetire 退休条目（TRY_RETIRE）：无退休额度返回 false，索引/resident 账目保留。
-func (c *cache[V]) tryRetire(s *shard[V], e *entry[V]) bool {
-	if !c.prepareRetirement(s, e) {
-		return false
-	}
-	e.readable.Store(false)
+// tryRetire 退休条目：从索引与策略链摘除，账目转入退休链，等待读者全部离开后回收。
+func (c *cache[V]) tryRetire(s *shard[V], e *entry) {
+	e.setReadable(false)
 	s.idx.remove(e)
 	s.policy.remove(e)
-	s.wheel.remove(e)
 	s.residentCount.Add(-1)
-	s.residentBytes.Add(-e.billedBytes)
+	s.residentBytes.Add(-int64(e.billedBytes))
 	c.registerRetired(s, e)
-	return true
 }
 
-const (
-	retiredWaitSafe int32 = iota
-	retiredSubmitting
-	retiredDisposing
-	retiredDone
-	retiredAccounted
-)
-
-// retiredRecord 记录退休对象，保留至安全释放且账目归还。
-type retiredRecord[V any] struct {
-	e           *entry[V]
-	s           *shard[V]
-	entryID     uint64
-	retireEpoch uint64
-	billed      int64
-	lease       [2]receipt // 退休字节 / 退休记录凭证：内嵌于池化记录，无逐次分配
-	state       atomic.Int32
-}
-
-// releaseLease 归还两项退休凭证（各至多一次）。
-func (r *retiredRecord[V]) releaseLease() {
-	r.lease[0].returnOnce()
-	r.lease[1].returnOnce()
-}
-
-type retiredPool[V any] struct {
-	mu    sync.Mutex
-	items []retiredRecord[V]
-	free  []*retiredRecord[V]
-}
-
-func newRetiredPool[V any](size int) *retiredPool[V] {
-	p := &retiredPool[V]{items: make([]retiredRecord[V], size), free: make([]*retiredRecord[V], size)}
-	for i := range p.items {
-		p.free[i] = &p.items[i]
+// registerRetired 把已摘除的条目追加到退休链尾，记录退休 epoch。
+// 退休链复用 policyNext（条目已不在策略链中）。
+func (c *cache[V]) registerRetired(s *shard[V], e *entry) {
+	er := s.arena.refOf(e)
+	e.retireEpoch = uint32(s.epoch.epoch.Load())
+	e.policyNext = 0
+	if s.retireTail == 0 {
+		s.retireHead = er
+	} else {
+		s.arena.entry(s.retireTail).policyNext = er
 	}
-	return p
-}
-
-func (p *retiredPool[V]) tryGet() (*retiredRecord[V], bool) {
-	if !p.mu.TryLock() {
-		return nil, false
-	}
-	if len(p.free) == 0 {
-		p.mu.Unlock()
-		return nil, false
-	}
-	r := p.free[len(p.free)-1]
-	p.free[len(p.free)-1] = nil
-	p.free = p.free[:len(p.free)-1]
-	p.mu.Unlock()
-	return r, true
-}
-
-func (p *retiredPool[V]) put(r *retiredRecord[V]) {
-	r.e, r.s = nil, nil
-	p.mu.Lock()
-	p.free = append(p.free, r)
-	p.mu.Unlock()
-}
-
-func (c *cache[V]) prepareRetirement(s *shard[V], e *entry[V]) bool {
-	if s.roundActive && (s.retireWorkLeft < 1 || s.retireBytesLeft < e.billedBytes) {
-		return false
-	}
-	r, ok := c.retiredPool.tryGet()
-	if !ok {
-		return false
-	}
-	if c.retiredBytes.tryReserveInto(&r.lease[0], e.billedBytes) != failOK {
-		c.retiredPool.put(r)
-		return false
-	}
-	if c.retiredRecords.tryReserveInto(&r.lease[1], 1) != failOK {
-		r.lease[0].returnOnce()
-		c.retiredPool.put(r)
-		return false
-	}
-	r.e, r.s, r.entryID = e, s, e.entryID
-	r.billed = e.billedBytes
-	r.state.Store(retiredWaitSafe)
-	e.retirement = r
-	return true
-}
-
-func (c *cache[V]) registerRetired(s *shard[V], e *entry[V]) {
-	if s.roundActive {
-		s.retireWorkLeft--
-		s.retireBytesLeft -= e.billedBytes
-	}
-	r := e.retirement
-	r.retireEpoch = s.epoch.epoch.Load()
-	e.retirement = nil
-	r.state.Store(retiredWaitSafe)
-	s.retired = append(s.retired, r)
+	s.retireTail = er
 	s.retiredCount.Add(1)
 }
 
-// reclaimStep 推进 epoch 并安全回收退休对象（RECLAIM_STEP，I9）。
+// reclaimStep 推进 epoch 并安全回收退休条目（RECLAIM_STEP，I9）。
+// 链头按退休顺序检查：epoch 已安全且无拥有型句柄持有才释放；否则移到链尾，
+// 避免被一个长期持有的条目挡住后面已可回收的条目。每轮检查数受配额限制。
+//
+// 有进展且退休链非空时，s.reclaimMore 为真，维护者立即续行而不等下一个周期：
+// 进展指释放了块，或有条目在等 epoch 且 epoch 仍在前进。只被拥有型句柄挡住（epoch 早已安全）、
+// 或被读者挡住（epoch 无法前进）时没有进展，仍按周期节流，不空转。
 func (c *cache[V]) reclaimStep(s *shard[V], quota int) int {
+	epochBefore, freed, waitEpoch := s.epoch.epoch.Load(), 0, false
 	work := s.epoch.advanceStep((quota + 1) / 2)
-	for work < quota && len(s.retired) > 0 {
-		i := s.retiredScan % len(s.retired)
-		r := s.retired[i]
+	for work < quota && s.retireHead != 0 {
+		er := s.retireHead
+		e := s.arena.entry(er)
 		work++
-		switch r.state.Load() {
-		case retiredWaitSafe:
-			if s.epoch.safeForReclaim(r.retireEpoch) && r.e.ownedPins.Load() == 0 {
-				bytes := r.e.billedBytes
-				if s.roundActive && bytes > s.reclaimBytesLeft {
-					s.retiredScan = (i + 1) % len(s.retired)
-					continue
-				}
-				if r.state.CompareAndSwap(retiredWaitSafe, retiredSubmitting) {
-					if !c.trySubmit(func() { c.disposeRetired(r) }) {
-						r.state.Store(retiredWaitSafe)
-					} else if s.roundActive {
-						s.reclaimBytesLeft -= bytes
-					}
-				}
-			}
-		case retiredDone:
-			if r.state.CompareAndSwap(retiredDone, retiredAccounted) {
-				r.releaseLease()
-				c.metrics.retiredCompleted.Add(1)
-			}
+		if s.retireHead = e.policyNext; s.retireHead == 0 {
+			s.retireTail = 0
 		}
-		if r.state.Load() != retiredAccounted {
-			s.retiredScan = (i + 1) % len(s.retired)
-		} else {
-			last := len(s.retired) - 1
-			s.retired[i] = s.retired[last]
-			s.retired[last] = nil
-			s.retired = s.retired[:last]
-			s.retiredScan = i
+		e.policyNext = 0
+		safe := s.epoch.safeForReclaim(e.retireEpoch)
+		if safe && e.ownedPins.Load() == 0 {
+			c.freeBlock(s, e)
+			freed++
 			s.retiredCount.Add(-1)
-			c.retiredPool.put(r)
+			c.metrics.retiredCompleted.Add(1)
+			continue
 		}
+		waitEpoch = waitEpoch || !safe
+		if s.retireTail == 0 {
+			s.retireHead = er
+		} else {
+			s.arena.entry(s.retireTail).policyNext = er
+		}
+		s.retireTail = er
 	}
+	s.reclaimMore = s.retireHead != 0 && (freed > 0 || waitEpoch && (s.epoch.scanActive || s.epoch.epoch.Load() != epochBefore))
 	return work
-}
-
-// disposeRetired 在回收执行器上运行：无索引/Flight/维护临界区。
-func (c *cache[V]) disposeRetired(r *retiredRecord[V]) {
-	r.state.Store(retiredDisposing)
-	e := r.e
-	var zero V
-	e.value = zero // 释放 value 引用，由 GC 回收
-	e.key = ""
-	r.s.pool.put(e)
-	r.e = nil
-	r.state.Store(retiredDone)
 }

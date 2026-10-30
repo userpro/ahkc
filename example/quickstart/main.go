@@ -16,14 +16,12 @@ import (
 func main() {
 	ctx := context.Background()
 
-	// 创建实例：MaxEntries / MaxResidentBytes 必填，其余走默认值。
-	// Prior 提供请求率先验：冷启动阶段（收益 sketch 热身的 2×ValueDelta 内）
-	// 也能给出估值，否则新填充会因 NO_ESTIMATE 一律拒绝。
-	c, err := ahkc.New[string](ahkc.Config{
-		MaxEntries:       1024,
-		MaxResidentBytes: 64 << 20,
+	// 创建实例：MaxEntries / MaxBytes 必填，其余走默认值。
+	c, err := ahkc.NewBytes[string](ahkc.Config{
+		MaxEntries: 1024,
+		MaxBytes:   64 << 20,
 		Namespaces: map[string]ahkc.NamespaceConfig{
-			"user": {TTL: time.Minute, Tin: 1, Prior: &ahkc.Prior{Lambda: 10}},
+			"user": {TTL: time.Minute, Tin: 1},
 		},
 	})
 	if err != nil {

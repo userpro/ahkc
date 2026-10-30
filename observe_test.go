@@ -2,6 +2,7 @@ package ahkc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"sync"
@@ -12,7 +13,7 @@ import (
 
 func TestHotKeysLimits(t *testing.T) {
 	for _, slots := range []int{0, 4} {
-		env := newTestEnv(t, NamespaceConfig{TTL: time.Minute}, func(c *Config) { c.ObserveHotKeys = slots })
+		env := newTestEnv(t, NamespaceConfig{TTL: time.Minute}, func(c *Config) { c.Hot.LoadSlots = slots })
 		if _, err := env.fetch("key", okLoader("v")); err != nil {
 			t.Fatal(err)
 		}
@@ -34,11 +35,11 @@ func TestCacheAndObservationModes(t *testing.T) {
 	for _, only := range []bool{false, true} {
 		for _, tracking := range []bool{false, true} {
 			t.Run(fmt.Sprintf("observeOnly=%v/tracking=%v", only, tracking), func(t *testing.T) {
-				env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1, Prior: testPrior}, func(c *Config) {
-					c.ObserveOnly, c.ObserveHotKeys = only, -1
+				env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 1}, func(c *Config) {
+					c.Mode, c.Hot.LoadSlots = modeOf(only), 0
 					if tracking {
-						c.ObserveHotKeys, c.ObserveRequestKeys = 8, 8
-						c.ObserveRequestSampleP, c.HotHistoryWindows = 1, 2
+						c.Hot.LoadSlots, c.Hot.RequestSlots = 8, 8
+						c.Hot.RequestSampleP, c.Hot.Windows = 1, 2
 					}
 				})
 				defer closeManual(t, env.c, env.ex)
@@ -79,16 +80,13 @@ func TestCacheAndObservationModes(t *testing.T) {
 	}
 }
 
-func TestObserveOnlyMemoryDoesNotScaleWithEntryLimit(t *testing.T) {
+func TestModeObserveMemoryDoesNotScaleWithEntryLimit(t *testing.T) {
 	var fixed int64
 	for _, entries := range []int64{64, 4096} {
 		env := newTestEnv(t, NamespaceConfig{TTL: time.Minute}, func(c *Config) {
-			c.ObserveOnly, c.MaxEntries = true, entries
+			c.Mode, c.MaxEntries = ModeObserve, entries
 		})
 		defer closeManual(t, env.c, env.ex)
-		if credits, ok := env.c.Credits(); !ok || credits.CountLimit != entries {
-			t.Fatal("observation changed the configured capacity ledger")
-		}
 		got := env.c.MemoryLimits().FixedBytes
 		if fixed != 0 && got != fixed {
 			t.Fatalf("unused resident capacity increased observation storage: %d -> %d", fixed, got)
@@ -97,11 +95,11 @@ func TestObserveOnlyMemoryDoesNotScaleWithEntryLimit(t *testing.T) {
 	}
 }
 
-// ---- 仅统计不缓存（ObserveOnly）----
+// ---- 仅统计不缓存（ModeObserve）----
 
-func TestObserveOnlyNeverCaches(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior},
-		func(c *Config) { c.ObserveOnly = true })
+func TestModeObserveNeverCaches(t *testing.T) {
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3},
+		func(c *Config) { c.Mode = ModeObserve })
 	loads := 0
 	loader := func(ctx context.Context, key string) (string, error) {
 		loads++
@@ -121,8 +119,8 @@ func TestObserveOnlyNeverCaches(t *testing.T) {
 		t.Fatalf("Get in observe mode: %v %v %v", v, ok, err)
 	}
 	st := env.c.Stats()
-	if !st.ObserveOnly {
-		t.Fatal("Stats.ObserveOnly = false")
+	if st.Mode != ModeObserve {
+		t.Fatal("Stats.Mode != ModeObserve")
 	}
 	if st.FillPublished != 0 {
 		t.Fatalf("FillPublished = %d, want 0", st.FillPublished)
@@ -139,9 +137,9 @@ func TestObserveOnlyNeverCaches(t *testing.T) {
 	}
 }
 
-func TestObserveOnlySingleflightStillMerges(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior},
-		func(c *Config) { c.ObserveOnly = true })
+func TestModeObserveSingleflightStillMerges(t *testing.T) {
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3},
+		func(c *Config) { c.Mode = ModeObserve; c.Hot.LoadSlots = 8 })
 	const n = 8
 	var mu sync.Mutex
 	loads := 0
@@ -183,9 +181,9 @@ func TestObserveOnlySingleflightStillMerges(t *testing.T) {
 	}
 }
 
-func TestObserveOnlyHeatProbe(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior},
-		func(c *Config) { c.ObserveOnly = true })
+func TestModeObserveHeatProbe(t *testing.T) {
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3},
+		func(c *Config) { c.Mode = ModeObserve })
 	for i := 0; i < 3; i++ {
 		if _, err := env.fetch("k1", okLoader("v")); err != nil {
 			t.Fatal(err)
@@ -210,7 +208,7 @@ func TestObserveOnlyHeatProbe(t *testing.T) {
 // TestHeatProbeNegativeCases 覆盖 Heat 探针的拒绝分支：
 // key 超限与实例关闭时 ok=false（纯观测接口的确定性契约）。
 func TestHeatProbeNegativeCases(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior},
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3},
 		func(c *Config) { c.MaxKeyBytes = 8 })
 	if _, err := env.fetch("k", okLoader("v")); err != nil {
 		t.Fatal(err)
@@ -228,11 +226,11 @@ func TestHeatProbeNegativeCases(t *testing.T) {
 	}
 }
 
-// ---- 热点 key 追踪（ObserveHotKeys）----
+// ---- 热点 key 追踪（Hot.LoadSlots）----
 
 func TestHotKeysRankSequentialDuplication(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior},
-		func(c *Config) { c.ObserveOnly = true; c.ObserveHotKeys = 4 })
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3},
+		func(c *Config) { c.Mode = ModeObserve; c.Hot.LoadSlots = 4 })
 	loader := okLoader("v")
 	// hot：同一桶内 5 次顺序加载（高度重复的顺序回源）；cold：1 次。
 	for i := 0; i < 5; i++ {
@@ -263,8 +261,8 @@ func TestHotKeysRankSequentialDuplication(t *testing.T) {
 
 func TestHotKeysEvictsColdest(t *testing.T) {
 	// 单分片 + 单槽位：逐出行为确定可见。
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior},
-		func(c *Config) { c.ObserveOnly = true; c.ObserveHotKeys = 1; c.ShardCount = 1 })
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3},
+		func(c *Config) { c.Mode = ModeObserve; c.Hot.LoadSlots = 1; c.Shards = 1 })
 	loader := okLoader("v")
 	if _, err := env.fetch("stale", loader); err != nil {
 		t.Fatal(err)
@@ -283,8 +281,8 @@ func TestHotKeysEvictsColdest(t *testing.T) {
 }
 
 func TestHotKeysWorksWithCachingEnabled(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior},
-		func(c *Config) { c.ObserveHotKeys = 8 })
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3},
+		func(c *Config) { c.Hot.LoadSlots = 8 })
 	// 正常缓存模式下：追踪生效，且不影响发布。
 	// Tin=3：前 3 次 miss 加载并在第 3 次完成时发布，后 2 次命中不再回源。
 	for i := 0; i < 5; i++ {
@@ -305,25 +303,23 @@ func TestHotKeysWorksWithCachingEnabled(t *testing.T) {
 	}
 }
 
-func TestObserveHotKeysConfigDefaults(t *testing.T) {
-	cfg := Config{ObserveOnly: true}
-	cfg.applyDefaults()
-	if cfg.ObserveHotKeys != 128 {
-		t.Fatalf("ObserveHotKeys = %d, want 128（观察模式默认开启）", cfg.ObserveHotKeys)
+// 槽位数取 0 即关闭，所有模式一致：没有特例默认值，负值不再表示关闭而是非法。
+func TestHotSlotsZeroDisablesInEveryMode(t *testing.T) {
+	for _, mode := range []Mode{ModeCache, ModeShadow, ModeObserve} {
+		cfg := Config{Mode: mode}
+		cfg.applyDefaults()
+		if cfg.Hot.LoadSlots != 0 || cfg.Hot.RequestSlots != 0 {
+			t.Fatalf("mode %d: Hot slots = %d/%d, want 0/0", mode, cfg.Hot.LoadSlots, cfg.Hot.RequestSlots)
+		}
 	}
-	cfg = Config{ObserveOnly: true, Advanced: Advanced{ObserveHotKeys: -1}}
-	cfg.applyDefaults()
-	if cfg.ObserveHotKeys != 0 {
-		t.Fatalf("ObserveHotKeys = %d, want 0（负值显式关闭）", cfg.ObserveHotKeys)
+	bad := validConfig()
+	bad.Hot.LoadSlots = -1
+	if _, err := NewBytes[string](bad); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("negative LoadSlots: err=%v, want ErrInvalidConfig", err)
 	}
-	cfg = Config{}
-	cfg.applyDefaults()
-	if cfg.ObserveHotKeys != 0 {
-		t.Fatalf("ObserveHotKeys = %d, want 0（普通模式默认关闭）", cfg.ObserveHotKeys)
-	}
-	// 端到端：显式关闭后无榜单。
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior},
-		func(c *Config) { c.ObserveOnly = true; c.ObserveHotKeys = -1 })
+	// 端到端：不配置槽位就没有榜单，热度探针不依赖榜单。
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3},
+		func(c *Config) { c.Mode = ModeObserve })
 	if _, err := env.fetch("k1", okLoader("v")); err != nil {
 		t.Fatal(err)
 	}
@@ -335,17 +331,20 @@ func TestObserveHotKeysConfigDefaults(t *testing.T) {
 	}
 }
 
-// TestObserveOnlyConcurrentStress 并发混合压测：真实时钟 + 默认执行器，
+// TestModeObserveConcurrentStress 并发混合压测：真实时钟 + 默认执行器，
 // 观察模式下逐出/计数/榜单并发安全，关闭三阶段照常完成（race 覆盖）。
-func TestObserveOnlyConcurrentStress(t *testing.T) {
-	c, err := New[string](Config{
-		ShardCount:       4,
-		MaxEntries:       1024,
-		MaxResidentBytes: 1 << 22,
-		ObserveOnly:      true, // 槽位少：强制逐出路径
+func TestModeObserveConcurrentStress(t *testing.T) {
+	c, err := NewBytes[string](Config{
+		Shards:     4,
+		MaxEntries: 1024,
+		MaxBytes:   1 << 22,
+		Mode:       ModeObserve, // 槽位少：强制逐出路径
 		Namespaces: map[string]NamespaceConfig{
 			"t": {TTL: time.Minute, Tin: 3},
-		}, Advanced: Advanced{ObserveHotKeys: 16},
+		},
+		Hot: HotConfig{
+			LoadSlots: 16,
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -389,7 +388,7 @@ func TestObserveOnlyConcurrentStress(t *testing.T) {
 		t.Fatalf("CloseState = %v %v %v", stopped, drained, reclaimed)
 	}
 	st := c.Stats()
-	if !st.ObserveOnly || st.FillPublished != 0 || st.ResidentEntries != 0 {
+	if st.Mode != ModeObserve || st.FillPublished != 0 || st.ResidentEntries != 0 {
 		t.Fatalf("observe invariants broken: %+v", st)
 	}
 	if st.FillRejected["OBSERVE_ONLY"] == 0 {
@@ -404,15 +403,15 @@ func TestObserveOnlyConcurrentStress(t *testing.T) {
 	}
 }
 
-// ---- 窗口摘要历史与滚动通知（HotHistoryWindows / OnHotWindow）----
+// ---- 窗口摘要历史与滚动通知（Hot.Windows / Hot.OnWindow）----
 
 func TestHotKeyHistoryRolls(t *testing.T) {
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior},
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3},
 		func(c *Config) {
-			c.ObserveOnly = true
-			c.ObserveHotKeys = 8
-			c.HotHistoryWindows = 2
-			c.HotHistoryTopN = 4
+			c.Mode = ModeObserve
+			c.Hot.LoadSlots = 8
+			c.Hot.Windows = 2
+			c.Hot.TopN = 4
 		})
 	loader := okLoader("v")
 	// 起始桶（t=1s，桶 1）内 hot 加载 3 次。
@@ -471,17 +470,17 @@ func TestHotKeyHistoryRolls(t *testing.T) {
 func TestOnHotWindowNotify(t *testing.T) {
 	var mu sync.Mutex
 	var got []HotSnapshot
-	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3, Prior: testPrior},
+	env := newTestEnv(t, NamespaceConfig{TTL: time.Minute, Tin: 3},
 		func(c *Config) {
-			c.ObserveOnly = true
-			c.ObserveHotKeys = 8
-			c.OnHotWindow = func(s HotSnapshot) {
+			c.Mode = ModeObserve
+			c.Hot.LoadSlots = 8
+			c.Hot.OnWindow = func(s HotSnapshot) {
 				mu.Lock()
 				got = append(got, s)
 				mu.Unlock()
 			}
 		})
-	// 仅通知模式（HotHistoryWindows=0）：无历史、有通知。
+	// 仅通知模式（Hot.Windows=0）：无历史、有通知。
 	if _, err := env.fetch("hot", okLoader("v")); err != nil {
 		t.Fatal(err)
 	}
@@ -498,7 +497,7 @@ func TestOnHotWindowNotify(t *testing.T) {
 	}
 	mu.Unlock()
 	if hist := env.c.HotKeyHistory(0); hist != nil {
-		t.Fatalf("history must be nil without HotHistoryWindows, got %+v", hist)
+		t.Fatalf("history must be nil without Hot.Windows, got %+v", hist)
 	}
 	// 同窗口内的重复维护不重复通知（每窗口至多一次）。
 	env.drive()
@@ -512,11 +511,12 @@ func TestOnHotWindowDroppedWhenExecutorRejects(t *testing.T) {
 	ex.fail.Store(true)
 	clk := NewManualClock(1_000_000_000)
 	cfg := validConfig()
-	cfg.ObserveOnly = true // 观察模式默认开 128 个追踪槽位
-	cfg.OnHotWindow = func(HotSnapshot) {}
-	cfg.Executor = ex
-	cfg.Clock = clk
-	c, err := New[string](cfg)
+	cfg.Mode = ModeObserve
+	cfg.Hot.LoadSlots = 8
+	cfg.Hot.OnWindow = func(HotSnapshot) {}
+	cfg.Runtime.Executor = ex
+	cfg.Runtime.Clock = clk
+	c, err := NewBytes[string](cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -537,16 +537,22 @@ func TestOnHotWindowDroppedWhenExecutorRejects(t *testing.T) {
 // 与 HotKeyHistory/HotKeys 并发读取安全（race 覆盖）。
 func TestHotWindowHistoryConcurrentStress(t *testing.T) {
 	var notified atomic.Uint64
-	c, err := New[string](Config{
-		ShardCount:       4,
-		MaxEntries:       1024,
-		MaxResidentBytes: 1 << 22,
-		ObserveOnly:      true,
-		HeatDelta:        10 * time.Millisecond,
+	c, err := NewBytes[string](Config{
+		Shards:     4,
+		MaxEntries: 1024,
+		MaxBytes:   1 << 22,
+		Mode:       ModeObserve,
 		Namespaces: map[string]NamespaceConfig{
 			"t": {TTL: time.Minute, Tin: 3},
-		}, Advanced: Advanced{ObserveHotKeys: 16, HotHistoryWindows: 4, // 压测期内多次滚动
-			OnHotWindow: func(s HotSnapshot) { notified.Add(1) }},
+		},
+		Heat: HeatConfig{
+			Delta: 10 * time.Millisecond,
+		},
+		Hot: HotConfig{
+			LoadSlots: 16,
+			Windows:   4, // 压测期内多次滚动
+			OnWindow:  func(s HotSnapshot) { notified.Add(1) },
+		},
 	})
 	if err != nil {
 		t.Fatal(err)

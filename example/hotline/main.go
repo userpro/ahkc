@@ -25,12 +25,15 @@ func main() {
 	if *duration <= 0 || *workers <= 0 || *numKeys <= 0 || *report <= 0 || !(*skew > 1) || math.IsInf(*skew, 0) {
 		panic("duration/workers/keys/report 须为正，skew 须有限且大于 1")
 	}
-	c, err := ahkc.New[string](ahkc.Config{
-		MaxEntries: int64(max(16, *numKeys)), MaxResidentBytes: 256 << 20,
+	c, err := ahkc.NewBytes[string](ahkc.Config{
+		MaxEntries: int64(max(16, *numKeys)),
+		MaxBytes:   256 << 20,
 		Namespaces: map[string]ahkc.NamespaceConfig{
-			"order": {TTL: 30 * time.Second, Tin: 3, Prior: &ahkc.Prior{Lambda: 30}},
+			"order": {TTL: 30 * time.Second, Tin: 3},
 		},
-		Advanced: ahkc.Advanced{ObserveHotKeys: 64},
+		Hot: ahkc.HotConfig{
+			LoadSlots: 64,
+		},
 	})
 	if err != nil {
 		panic(err)
